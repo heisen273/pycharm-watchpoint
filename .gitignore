@@ -22,6 +22,11 @@ out/
 ### IntelliJ Platform sandbox (produced by `./gradlew runIde`) ###
 .intellijPlatform/
 
+### Python bytecode ###
+__pycache__/
+*.pyc
+*.pyo
+
 ### Eclipse ###
 .apt_generated
 .classpath
