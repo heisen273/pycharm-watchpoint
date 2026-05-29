@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(xargs -I {} unzip -l \"{}\")",
+      "Bash(grep -rn \"import pydevd$\\\\|sys\\\\.modules\\\\['pydevd'\\\\]\\\\|sys\\\\.modules\\\\[\\\\\"pydevd\\\\\"\\\\]\" /Users/me/.gradle/caches/8.13/transforms/52a9665b28a4cb7a80067ff8fe9281f5/transformed/pycharm-community-2025.1-aarch64/plugins/python-ce/helpers/pydev/)",
+      "Bash(./gradlew compileKotlin)",
+      "Bash(xargs -I {} sh -c 'unzip -l \"{}\" 2>/dev/null | grep -q \"XValueNodeImpl.class\" && echo \"{}\"')",
+      "Bash(unzip -l app.jar)",
+      "Read(//private/tmp/**)",
+      "Bash(unzip -o -q \"/Applications/PyCharm CE 4.app/Contents/lib/app-client.jar\" \"com/intellij/xdebugger/impl/ui/tree/actions/XDebuggerTreeActionBase.class\")",
+      "Bash(javap -p com/intellij/xdebugger/impl/ui/tree/actions/XDebuggerTreeActionBase.class)",
+      "Bash(unzip -o -q \"/Applications/PyCharm CE 4.app/Contents/lib/app.jar\" \"com/intellij/openapi/actionSystem/AnAction.class\")",
+      "Bash(javap -p /tmp/com/intellij/openapi/actionSystem/AnAction.class)",
+      "Bash(unzip -o -q \"/Applications/PyCharm CE 4.app/Contents/lib/app-client.jar\" \"com/intellij/openapi/actionSystem/AnAction.class\")",
+      "Bash(javap -p com/intellij/openapi/actionSystem/AnAction.class)",
+      "Bash(javap -c com/intellij/xdebugger/impl/ui/tree/actions/XDebuggerTreeActionBase.class)",
+      "Bash(javap -p /tmp/com/intellij/xdebugger/impl/ui/tree/actions/XDebuggerTreeActionBase.class)",
+      "Bash(./gradlew --stop)",
+      "Bash(unzip -p python-ce.jar)",
+      "Bash(unzip -l python-ce.jar)",
+      "Bash(unzip -p python-ce.jar com/jetbrains/python/debugger/PyDebugRunner.class)",
+      "Bash(javap -p /tmp/PyDebugRunner.class)",
+      "Bash(javap -c /tmp/PyDebugRunner.class)",
+      "Bash(awk '/private static void applyRegistryFlags/,/^  [a-z]/')",
+      "Bash(awk '/private static void applyRegistryFlags/{flag=1} flag{print; if\\(/^  [^ ]/ && !/private static void applyRegistryFlags/\\){c++; if\\(c>2\\)exit}}' /tmp/pdr.txt)",
+      "Bash(awk '/applyRegistryFlags\\\\\\(com/{found=1; start=NR} found && NR > start && /^  [a-z]/ {print \"END\"; exit} found {print NR\": \"$0}' /tmp/pdr.txt)",
+      "Bash(awk '/PyDebugProcess/' /Users/me/projects/my/pythonwatchpoint/src/main/kotlin/com/pythonwatchpoint/listeners/WatchpointHitHighlighter.kt)",
+      "Bash(awk *)"
+    ]
+  }
+}

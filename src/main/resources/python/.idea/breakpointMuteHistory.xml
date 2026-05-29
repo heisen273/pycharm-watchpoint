@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="BreakpointMuteHistory">
+    <option name="currentIndex" value="6" />
+    <option name="history">
+      <list>
+        <BreakpointMuteEntry>
+          <option name="breakpointTypeId" value="python-line" />
+          <option name="fileUrl" value="file://$PROJECT_DIR$/test_watchpoint.py" />
+          <option name="line" value="42" />
+          <option name="newState" value="true" />
+          <option name="timestamp" value="1779868500455" />
+          <option name="type" value="ADDED" />
+        </BreakpointMuteEntry>
+        <BreakpointMuteEntry>
+          <option name="breakpointTypeId" value="python-line" />
+          <option name="fileUrl" value="file://$PROJECT_DIR$/test_watchpoint.py" />
+          <option name="groupId" value="1779868573425" />
+          <option name="line" value="42" />
+          <option name="newState" value="true" />
+          <option name="timestamp" value="1779868573425" />
+          <option name="type" value="REMOVED" />
+        </BreakpointMuteEntry>
+        <BreakpointMuteEntry>
+          <option name="breakpointTypeId" value="python-line" />
+          <option name="fileUrl" value="file://$PROJECT_DIR$/test_watchpoint.py" />
+          <option name="groupId" value="1779868573425" />
+          <option name="line" value="51" />
+          <option name="newState" value="true" />
+          <option name="timestamp" value="1779868573425" />
+          <option name="type" value="ADDED" />
+        </BreakpointMuteEntry>
+        <BreakpointMuteEntry>
+          <option name="breakpointTypeId" value="python-line" />
+          <option name="fileUrl" value="file://$PROJECT_DIR$/test_watchpoint.py" />
+          <option name="line" value="42" />
+          <option name="newState" value="true" />
+          <option name="timestamp" value="1779868584929" />
+          <option name="type" value="ADDED" />
+        </BreakpointMuteEntry>
+        <BreakpointMuteEntry>
+          <option name="breakpointTypeId" value="python-line" />
+          <option name="fileUrl" value="file://$PROJECT_DIR$/test_watchpoint.py" />
+          <option name="line" value="42" />
+          <option name="newState" value="true" />
+          <option name="timestamp" value="1779868585319" />
+          <option name="type" value="REMOVED" />
+        </BreakpointMuteEntry>
+        <BreakpointMuteEntry>
+          <option name="breakpointTypeId" value="python-line" />
+          <option name="fileUrl" value="file://$PROJECT_DIR$/watchpoint.py" />
+          <option name="line" value="28" />
+          <option name="newState" value="true" />
+          <option name="timestamp" value="1779868922085" />
+          <option name="type" value="ADDED" />
+        </BreakpointMuteEntry>
+        <BreakpointMuteEntry>
+          <option name="breakpointTypeId" value="python-line" />
+          <option name="fileUrl" value="file://$PROJECT_DIR$/watchpoint.py" />
+          <option name="line" value="28" />
+          <option name="newState" value="true" />
+          <option name="timestamp" value="1779868922800" />
+          <option name="type" value="REMOVED" />
+        </BreakpointMuteEntry>
+      </list>
+    </option>
+  </component>
+</project>

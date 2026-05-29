@@ -1,0 +1,58 @@
+<idea-plugin>
+    <id>com.pythonwatchpoint</id>
+    <name>Python Watchpoint</name>
+    <vendor>YourName</vendor>
+    <description><![CDATA[
+        Adds <b>watchpoint</b> support to PyCharm for Python 3.12+: when a watched
+        local variable or object attribute changes value, the debugger pauses
+        automatically at the line that performed the change.
+
+        Two entry points:
+        <ul>
+          <li><b>Debug with Watchpoint</b> – debug toolbar action; injects watchpoint.py
+          into the new debug session so <code>watch("x")</code>, <code>watch("obj.attr")</code>
+          etc. are available from your code.</li>
+          <li><b>Add Watchpoint</b> – right-click any variable in the
+          debugger's Variables panel to arm a watchpoint on it from a paused session.
+          The same entry toggles to <b>Remove Watchpoint</b> when the selected variable
+          is already armed, and supports multi-select (mixed selections add to the
+          unwatched ones).</li>
+        </ul>
+
+        Implementation uses Python 3.12+ <code>sys.monitoring</code> with strict
+        per-code-object local events, so there is zero global overhead until you
+        watch something – even in very large codebases.
+    ]]></description>
+
+    <depends>com.intellij.modules.python</depends>
+    <depends>com.intellij.modules.platform</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <projectService serviceImplementation="com.pythonwatchpoint.services.WatchpointSessionManager"/>
+        <projectService serviceImplementation="com.pythonwatchpoint.services.WatchpointMarkerService"/>
+    </extensions>
+
+    <projectListeners>
+        <listener class="com.pythonwatchpoint.listeners.WatchpointDebugListener"
+                  topic="com.intellij.xdebugger.XDebuggerManagerListener"/>
+    </projectListeners>
+
+    <actions>
+        <action id="PythonWatchpoint.DebugWithWatchpoint"
+                class="com.pythonwatchpoint.actions.DebugWithWatchpointAction"
+                text="Debug with Watchpoint"
+                description="Start debugging with watchpoint support enabled"
+                icon="com.pythonwatchpoint.icons.WatchpointIcons.DebugWatch">
+            <add-to-group group-id="XDebugger.ToolWindow.TopToolbar" anchor="last"/>
+            <add-to-group group-id="MainToolbarRight" anchor="first"/>
+        </action>
+
+        <action id="PythonWatchpoint.AddWatchpoint"
+                class="com.pythonwatchpoint.actions.AddWatchpointAction"
+                text="Add Watchpoint"
+                description="Pause the debugger whenever the selected variable's value changes"
+                icon="com.pythonwatchpoint.icons.WatchpointIcons.Watch">
+            <add-to-group group-id="XDebugger.ValueGroup" anchor="first"/>
+        </action>
+    </actions>
+</idea-plugin>

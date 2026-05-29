@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//private/tmp/**)",
+      "Bash(unzip -p \"/Applications/PyCharm CE 4.app/Contents/plugins/python-ce/lib/python-ce.jar\" com/jetbrains/python/debugger/PyDebugValue.class)",
+      "Bash(javap -p /tmp/pdv.class)",
+      "Bash(javap -p -v /tmp/pdv.class)",
+      "Bash(unzip -p \"/Applications/PyCharm CE 4.app/Contents/plugins/python-ce/lib/python-ce.jar\" com/jetbrains/python/debugger/PyDebugProcess.class)",
+      "Bash(javap -p /tmp/pdp.class)",
+      "Bash(javap -p -v /tmp/pdp.class)"
+    ]
+  }
+}
