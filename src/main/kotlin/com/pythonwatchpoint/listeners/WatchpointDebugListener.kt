@@ -127,6 +127,10 @@ class WatchpointDebugListener(private val project: Project) : XDebuggerManagerLi
      *
      * `notifyOnTerminate=true`  → also break if the exception propagates to top
      * `notifyOnlyOnFirst=false` → break on every occurrence, not just first
+     *
+     * Before registering, sweeps for any stale WatchpointHit breakpoints left in the
+     * persistent breakpoint manager by a previous crashed session or an older plugin
+     * version (which used `watchpoint.WatchpointHit` without the underscore prefix).
      */
     private fun addWatchpointHitBreakpoint(debugProcess: XDebugProcess) {
         try {
@@ -134,6 +138,20 @@ class WatchpointDebugListener(private val project: Project) : XDebuggerManagerLi
                 val manager: XBreakpointManager = XDebuggerManager.getInstance(project).breakpointManager
                 val type = XBreakpointType.EXTENSION_POINT_NAME
                     .findExtensionOrFail(PyExceptionBreakpointType::class.java)
+
+                // Remove stale WatchpointHit breakpoints that may have been persisted
+                // by a crashed session or an older plugin version (e.g. the old name
+                // `watchpoint.WatchpointHit` without the underscore prefix).
+                // `getException()` is declared on the superclass ExceptionBreakpointProperties.
+                @Suppress("UNCHECKED_CAST")
+                val existing = manager.getBreakpoints(type)
+                for (bp in existing.toList()) {  // toList() – copy before mutating
+                    val exceptionName = bp.properties?.exception ?: continue
+                    if ("WatchpointHit" in exceptionName) {
+                        manager.removeBreakpoint(bp)
+                        logger.warn("Removed stale WatchpointHit breakpoint: $exceptionName")
+                    }
+                }
 
                 val props = PyExceptionBreakpointProperties("_pycharm_watchpoint.WatchpointHit")
                 props.isNotifyOnTerminate = true

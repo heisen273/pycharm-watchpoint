@@ -169,6 +169,7 @@ if os.environ.get('PYCHARM_WATCHPOINT_ACTIVE') == '1':
             envs["PYCHARM_WATCHPOINT_ACTIVE"] = "1"
             project.basePath?.let { envs["PYCHARM_WATCHPOINT_USER_ROOTS"] = it }
 
+
             config.envs = envs
             logger.warn("Injected watchpoint at: ${tempDir.absolutePath}")
         } catch (e: Exception) {

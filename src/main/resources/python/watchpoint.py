@@ -2880,6 +2880,11 @@ _FRAMEWORK_MODULE_ROOTS = frozenset({
     "werkzeug", "flask", "django_extensions",
     "requests", "urllib3", "tornado", "aiohttp", "httpx", "starlette", "fastapi",
     "tortoise", "peewee", "sqlmodel", "pony", "mongoengine",
+    "celery", "kombu", "redis", "pymongo",
+    "boto3", "botocore",
+    "grpc", "_grpc",
+    "sentry_sdk", "loguru",
+    "uvicorn", "gunicorn",
     "pytest", "_pytest", "pluggy",
     "setuptools", "pkg_resources", "_distutils_hack",
     # Our own runtime module is registered as "_pycharm_watchpoint" in sys.modules
@@ -2943,6 +2948,7 @@ def _is_user_defined_type(t: Optional[type]) -> bool:
 # for normal DTO trees (typically < 20 sub-watches) and small enough to
 # catch a runaway before pydevd's hit queue overflows.
 _MAX_SUB_WATCHES_PER_ROOT = 100
+
 
 
 # ---------------------------------------------------------------------------
