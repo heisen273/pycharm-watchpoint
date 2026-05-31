@@ -8,7 +8,7 @@ site. The Kotlin plugin is upstream of this directory and is not covered here.
 ## TL;DR
 
 - `watchpoint.py` – runtime: registry, sys.monitoring callbacks, pydevd integration.
-- `test_watchpoint.py` – 121 tests, pure-pytest (no pydevd).
+- `test_watchpoint.py` – 184 tests, pure-pytest (no pydevd).
 - `conftest.py` – per-test cleanup of registry + frame state.
 - Targets **Python 3.12, 3.13, 3.14** – all three are run in CI-style local checks.
 - Performance design: **zero global sys.monitoring overhead** until the first `watch()` call.
@@ -196,29 +196,38 @@ Documented trade-offs (each pinned by a regression test):
 
 `_add_object_watch` first calls `_install_single_object_watch` (which is
 the old class-surgery path factored out), then `_instrument_object_tree`
-walks `obj.__dict__` (cycle-guarded by a visited-id set, depth-capped
-by `_RECURSIVE_OBJECT_WATCH_DEPTH = 4`):
+walks `obj.__dict__` (cycle-guarded by `root_watch.visited_ids`, depth-capped
+by `_RECURSIVE_OBJECT_WATCH_DEPTH = 4`, breadth-capped by
+`_MAX_SUB_WATCHES_PER_ROOT = 100`):
 
-- User-defined-object attrs → recursive `_install_single_object_watch`
+- User-defined-object attrs whose type is NOT a class object AND passes
+  `_is_user_defined_type` → recursive `_install_single_object_watch`
   on the nested value, then `_instrument_object_tree` one level deeper.
 - list/dict/set attrs → `_wrap_container` + guarded `setattr` to install
   the wrapper at the nested attribute.
-- Anything else → skip.
+- Framework-typed attrs (Django QuerySet, SQLAlchemy session, stdlib
+  types, anything under site-packages) → skipped at the boundary.
+- Class objects (`isinstance(value, type)`) → skipped. Walking a class's
+  `__dict__` resolves every descriptor / property / classmethod and
+  chains explosively under ORMs.
+- Anything else (primitives, builtins, already-watched values) → skip.
 
 Every sub-instrumentation creates an `_AttributeWatch` appended to the
-root's `sub_watches` list. The sub-watches are NOT registered in
-`_attr_watches` (avoids collision with user-installed dotted watches).
+root's `sub_watches` list via `_try_add_sub_watch` (the cap-respecting
+helper). Sub-watches are NOT registered in `_attr_watches` (avoids
+collision with user-installed dotted watches).
 `_remove_attr_watch_locked` reverses `sub_watches` and undoes each via
 `_undo_attr_watch_payload` so containers come off while their parent's
 class surgery is still active to swallow the un-wrap setattr.
 
 The watcher's `__setattr__` also auto-instruments newly assigned values:
 if user code does `obj.x = new_settings_dataclass`, the new value gets
-class surgery + a fresh recursive walk under the same root. New container
-assignments get wrapped too. Both happen under the guard so the
-auto-instrumentation never fires itself.
+class surgery + a fresh recursive walk under the same root **sharing the
+root's `visited_ids` set and respecting the same type / class-object /
+breadth filters**. New container assignments get wrapped too. Both
+happen under the guard so the auto-instrumentation never fires itself.
 
-Two guarantees to preserve:
+Three guarantees to preserve:
 - **Class-surgery is per-object, not per-class.** Each call to
   `_make_any_attr_watcher_class` produces a fresh class with closure-
   captured `_expr` (this object's path) + `_root_expr` (the user's
@@ -229,6 +238,14 @@ Two guarantees to preserve:
   direct attributes ARE instrumented; depth-5 ones aren't. Two regression
   tests (`test_recursive_watch_depth_cap` and
   `test_recursive_watch_depth_at_cap_still_fires`) pin both sides.
+- **`visited_ids` lives on `root_watch`, not as a per-call argument.**
+  This is what stops the Django-shaped explosion: framework descriptors
+  fabricate fresh proxy instances on each access, so a per-call set
+  never matched across `__setattr__` re-entries and each re-entry
+  started a brand-new depth-1 walk. Sharing the set across all entries
+  (initial walk + every later auto-instrument) is what bounds the
+  recursion under truly cyclic graphs.
+  `test_visited_ids_shared_across_setattr_reentry` pins this down.
 
 Limitations the design intentionally accepts:
 - Containers' CONTENTS (e.g., a list-of-user-objects) are not recursed
@@ -239,6 +256,22 @@ Limitations the design intentionally accepts:
   `__setattr__`), but nested user objects under slotted attrs aren't
   auto-discovered.
 - `@property` and descriptor-backed attrs aren't iterated.
+- **Framework / stdlib / site-packages types are not recursed into.**
+  Watching a Django QuerySet directly catches rebinds of the local
+  variable (via local-variable detection if class surgery is also
+  blocked by the metaclass) plus top-level setattr via classpatch;
+  it does NOT instrument ORM internals. A user DTO whose attribute IS
+  a Django QuerySet still gets full instrumentation on the DTO – we
+  just stop walking when we reach the QuerySet. Filtering happens
+  via `_is_user_defined_type` (denylist of module roots +
+  site-packages / dist-packages file-path heuristic). See
+  `_FRAMEWORK_MODULE_ROOTS` and the
+  `test_is_user_defined_type_*` / `test_recursion_stops_at_framework_boundary`
+  tests for what the contract covers.
+- **Class objects are not recursed into.** `obj.held_class = SomeClass`
+  treats `SomeClass` as opaque – no `__class__` swap on a class, no
+  walk of its descriptor-laden `__dict__`. Pinned by
+  `test_recursion_skips_class_objects`.
 
 ### 10. Classpatch fallback for hostile metaclasses
 
@@ -322,6 +355,516 @@ real frameworks but pinned by `_StubbornDjangoLikeMeta` tests):
 bare-name watch falls through to local-variable rebind detection;
 dotted watch raises a clean `TypeError` naming both failure modes so
 the user understands neither subclassing nor classpatching worked.
+
+### 11. Sequential pre-emptive breakpoints – one IDE pause per mutation
+
+When N back-to-back mutations fire before any of them pause (e.g.
+Django `QuerySet._clone()` does `self._hints = ...` then
+`self._query = ...` on consecutive lines of `query.py`), each hit
+installs its OWN pydevd `LineBreakpoint` at a successive code line
+via `_compute_bp_targets` + `_install_bp_at`. The IDE then pauses
+N times – once per bp – and each `sessionPaused` calls
+`_pycharm_consume_last_hit(pause_file, pause_line)` which drains
+ONLY the hit whose bp fired THIS pause, leaving the rest queued
+for their own future pauses.
+
+**Why the old `_pause_pending` gate was removed (v8 change):**
+
+The previous design had a process-level boolean `_pause_pending`
+that suppressed hits 2..N when a pause was already armed. That was
+fine for the Django `QuerySet._clone()` symptom (two yellow lines
+on the same `sessionPaused`), but it MASKED the 4-mutation
+auth-middleware case where the user explicitly wanted to see EACH
+attribute change as a separate debugger pause. The gate silently
+dropped 3 of 4 mutations with no diagnostic. The sequential-bps
+approach gives N pauses for N mutations – the user steps through
+each one individually.
+
+**Sequential allocation mechanism:**
+
+`_next_slot_for_code(code, start_line)` scans the existing hit
+queue's `bp_locations` plus in-flight reservations (from
+`_bp_slot_reservations`) to find which lines in the given code
+object already have bps armed. It searches after
+`max(max(used_lines), start_line)` – never backward past the
+current mutation line – and returns the next `co_lines()` line
+strictly after that. This is what spreads N hits across lines
+80, 81, 82, 84 (skipping blank lines) in the same code object.
+The `max(..., start_line)` guard (v21 fix) prevents a previous
+hit's bp at e.g. line 287 from pulling the search backward when
+the current mutation is at line 288 – without it, `_next_code_line_in`
+would return 288 itself (the mutation line, already executing).
+
+`_compute_bp_targets(user_frame, source_line)` builds up to TWO slots per hit:
+- **Primary**: next future code line in `user_frame.f_code` (the
+  mutation site). When `source_line == user_frame.f_lineno`, the runtime
+  first tries `_next_code_line_after_frame(user_frame)`, which uses
+  `frame.f_lasti` and `dis.get_instructions(...)` to find the next LINE
+  event after the current bytecode offset. This is critical for multi-line
+  statements: in `request.parsed = ParsedRequest(...)`, `STORE_ATTR`
+  still reports line 105, but RHS lines 106-112 already executed before
+  the attribute write. The correct primary bp is line 114 (`return
+  request`), not line 106.
+- **Safety**: next code line in the walked-up user-code frame via
+  `_find_user_code_caller`. Fires reliably even when pydevd's
+  per-code monitoring doesn't arm LINE for the primary's library
+  frame.
+
+When primary is exhausted (mutation on the function's last code
+line), we walk `f_back` through caller frames until we find one
+with a valid next code line – preferring contextually close frames
+over the distant safety net.
+
+**Selective drain in `_pycharm_consume_last_hit(pause_file, pause_line)`:**
+
+A hit matches when ANY of its `bp_locations` tuples has the same
+`(file, line)` as the IDE's current pause. Hits with empty
+`bp_locations` (the `do_wait_suspend` fallback path) match ANY
+pause location so they don't leak. On drain, ALL bps belonging
+to matched hits are removed (including the unfired sibling bp)
+so they don't surface as phantom pauses later.
+
+The 256-element cap on `_hit_queue` is kept as belt-and-suspenders
+– in normal operation the queue stays small (N hits install N bps;
+each fires within one or two LINE events).
+
+Test: `test_back_to_back_hits_install_sequential_bps` (core
+sequential-allocation behavior: N mutations → N distinct bp
+locations, each drainable independently). The openapi multiline
+assignment case is pinned by
+`test_handle_hit_uses_bytecode_next_line_for_multiline_attr_assignment`.
+
+### 12. Pause anchor walk-up (mutation in library code)
+
+The user_frame that `_handle_hit` receives is the IMMEDIATE caller
+of the watcher's `__setattr__` – produced by `_find_user_caller`
+which only walks past `<string>` runtime frames. When the watched
+mutation happens inside framework code (Django's `QuerySet._clone`
+does `self._hints = {}` then `self._query = sql.Query(...)`;
+SQLAlchemy session flush; pydantic model rebuild; etc.) that
+frame is in `site-packages` – and PyCharm's "do not step into
+library code" filter (on by default) causes pydevd's
+`CMD_STEP_OVER + step_stop = library_frame` to be silently
+skipped. The mutation fires, the IDE highlights the line, but
+the debugger never actually pauses. The cascade up via PY_RETURN
+dies in further library frames before reaching user code.
+
+`_handle_hit` works around this by computing a separate
+**pause anchor**: walk further up the stack past site-packages
+frames via `_find_user_code_caller` to find the user's own code,
+and anchor `_pause_via_pydevd` on THAT frame. The library
+mutation is still recorded as the SOURCE (the `source_file` /
+`source_line` parameters carry the actual mutation site, so the
+highlight renders e.g. on `query.py:289`), but the debugger
+suspends at the user's code that called into the library (e.g.
+`users/models.py:956` where they wrote `self.groups.all()`).
+
+The split:
+- **Source line** (highlight + stderr log) → actual mutation
+  site, from `user_caller` at the watcher's call site.
+- **Pause anchor** (pydevd `step_stop`) → nearest user-code
+  frame walking up `f_back` from the mutation site.
+
+If the entire chain is library / runtime (no user code in 32
+hops), the hit is **dropped silently** before the queue or the
+dedupe gate. A phantom highlight with no debugger pause behind
+it is worse UX than no signal at all – the user would click
+around confused why nothing stopped.
+
+`_is_library_filename` matches `site-packages` / `dist-packages`
+(third-party) AND files under the stdlib install directory
+(computed once at module load via `os.path.dirname(os.__file__)`,
+stored in `_STDLIB_DIR_PREFIX`). Both categories are filtered
+because pydevd's "do not step into library code" filter treats
+them identically – anchoring on either silently swallows the
+pause. The deepcopy case (`copy.deepcopy(qs)` →
+`copy.py:143` mutation) was the original report that proved this:
+the walk-up MUST skip stdlib too.
+
+Guarantees to preserve:
+- **Source line stays at the mutation site.** The user wants to
+  see "Django changed `_hints` at `query.py:289`" via the
+  highlight + stderr log. Only the pydevd anchor moves.
+- **Drop-on-pure-library is silent + leaves the gate cleared.**
+  Setting the gate on a dropped hit would silently swallow
+  future legitimate user-code hits. The drop must be invisible.
+- **Stdlib IS library** for pause-anchor purposes. Anything
+  under the Python install root (stdlib OR third-party) goes
+  through pydevd's library filter; anchoring there is broken.
+
+Tests:
+- `test_find_user_code_caller_walks_past_site_packages`
+- `test_find_user_code_caller_returns_none_for_pure_library_chain`
+- `test_find_user_code_caller_walks_past_stdlib`
+- `test_find_user_code_caller_handles_deepcopy_through_django_chain`
+- `test_handle_hit_anchors_pause_on_user_code_when_mutation_is_in_library`
+- `test_handle_hit_drops_when_chain_is_entirely_library`
+
+### 13. Pause mechanism – pydevd `LineBreakpoint`, not `CMD_STEP_OVER`
+
+**Originally** `_handle_hit` armed `info.pydev_step_cmd = CMD_STEP_OVER`
+with `step_stop = user_frame`, mirroring `pydevd.settrace(stop_at_frame=...)`'s
+internal mechanism. This is documented in "The pydevd pause" section
+below and is still implemented as `_pause_via_pydevd` for reference /
+fallback. **It was unreliable in PEP 669 mode for arbitrary deep user
+frames.** Root cause: pydevd's `py_start_callback` decides LINE-tracing
+per-code-object at the function's FIRST entry. For functions that had
+no breakpoints at that moment, LINE tracing is never enabled. Our later
+`set_local_events(LINE | PY_RETURN)` armed the events at the C level
+but pydevd's own callback-dispatch bookkeeping ignored them – there's
+no way to retroactively run `py_start_callback` for a function that's
+already mid-execution. `restart_events()` re-fires events that ARE
+armed; it doesn't fabricate fresh PY_STARTs.
+
+**Now** the primary pause mechanism in `_handle_hit` is
+`_compute_bp_targets(...)` + `_install_bp_at(...)`: compute one or more
+future bp locations, then install pydevd `LineBreakpoint`s there.
+Pydevd's breakpoint engine is the most heavily exercised code path in
+pydevd – when the bp's line is reached, the pause fires reliably.
+
+Pipeline:
+
+1. **Find the primary line in execution order, not just source order.**
+   For attribute/classpatch hits where `source_line == user_frame.f_lineno`,
+   `_next_slot_after_frame(user_frame)` calls
+   `_next_code_line_after_frame(frame)`, which uses `frame.f_lasti` to
+   scan bytecode instructions after the current offset and pick the next
+   future LINE event. This fixes the openapi shape:
+
+   ```python
+   request.parsed = ParsedRequest(
+       body=result.body,
+       ...
+   )
+
+   return request
+   ```
+
+   `STORE_ATTR` reports line 105, but argument lines 106-112 have already
+   executed. Numeric lookup (`_next_code_line_in(code, 105)`) would pick
+   106, which never fires. Bytecode-order lookup picks line 114.
+
+   **Backward-line rejection (v21 fix):** `_next_code_line_after_frame`
+   also requires `line > current_line`. CPython's `RETURN_CONST` at the
+   end of a function can be tagged with an earlier source line (e.g. the
+   closing bracket of a multi-line expression on line 287 when the
+   mutation is at line 288). Without this check, the function returns 287
+   – a line that already executed – and the bp never fires. With the
+   check, it returns None, falling through to the f_back walk.
+
+   **Exception-handler-line skip (v20 fix):** `_next_code_line_after_frame`
+   also skips handler-entry lines (the `except ...:` clause). When the
+   mutation is the last normal statement in a try body, bytecode order
+   points at the handler next, but that line is unreachable on the
+   no-exception path. `_get_except_handler_lines(code)` identifies them.
+
+2. **Fall back to `_next_code_line_in(code, after_line)` for ordinary
+   numeric lookup.** It uses `code.co_lines()` (Python 3.10+) and only
+   returns actual code lines. Blank lines, lines past the last statement,
+   and lines between statements are excluded. The `set_accessible_products`
+   case motivated this: the function's last statement was on line 195,
+   `f_lineno + 1` = 196 is blank, and a bp at 196 never fires.
+
+3. **Install primary + safety candidates.** The primary is in the mutation
+   frame. If the primary is exhausted, `_compute_bp_targets` walks `f_back`
+   to find the nearest contextual caller frame with a valid next line. The
+   safety candidate is the nearest walked-up user-code frame from
+   `_find_user_code_caller`. Whichever candidate fires first wins; sibling
+   bps are removed during `_on_line`/consume cleanup.
+
+4. **`py_db.consolidate_breakpoints(file, id_to_bp, py_db.breakpoints)`**
+   is pydevd's standard breakpoint-install API. It rebuilds the line-to-bp
+   map and (in PEP 669 mode) calls `restart_events()`. That's not
+   sufficient on its own (see step 5) but it's required for pydevd's
+   `py_line_callback` to recognize the bp when it eventually fires.
+
+5. **`sys.monitoring.set_local_events(DEBUGGER_ID, target_code, existing | LINE | PY_RETURN)`**
+   on `target_code` – the code object that contains the bp's line.
+   This is the critical addition: it FORCES events armed on the code
+   object for pydevd's tool, regardless of what `py_start_callback`
+   previously decided. Without this step, the bp lives in pydevd's
+   table but pydevd's `py_line_callback` never fires for the current
+   invocation (because LINE was disabled for the code object at the
+   function's start) and the bp can't be checked.
+
+6. **Track installed bps in `WatchpointRegistry._temp_breakpoints`**
+   and remove them in `_pycharm_consume_last_hit` (drains every
+   sessionPaused, watchpoint or not). The bp_id is negative so it
+   won't collide with pydevd's positive IDE-assigned IDs.
+
+**Last-resort fallback: `_pause_via_do_wait_suspend`.** When the user's
+mutation is at the last statement of a module/function AND f_back is
+not user code (e.g., `script.py` last-line case, or a script run via
+`python script.py` where the only user frame IS the module), neither
+candidate yields a valid line. `_compute_bp_targets` returns empty.
+Falling back to a do_wait_suspend on the pause anchor puts
+`urllib.parse.quote` on the user thread's stack at pause time (rule-1
+trade-off in "The pydevd pause" §) but guarantees the IDE pauses. The
+user can click their own frame in the Frames panel to see their code;
+the highlight on the actual mutation line still renders. Silent no-pause
+on a deliberate `watch(...)` is worse UX than ugly-stack pause.
+
+Guarantees to preserve:
+
+- **Source line stays at the mutation site.** The IDE highlighter
+  uses the `source_file`/`source_line` arguments to `_handle_hit`, NOT
+  the bp's line. So the yellow highlight renders on e.g.
+  `user_hotel_relationship.py:195` (the actual mutation) even though
+  the IDE pauses at `features_calculation.py:594` (the bp).
+- **`set_local_events` on `target_code` is load-bearing.** Without it,
+  `consolidate_breakpoints` + `restart_events` is not enough: pydevd's
+  `py_line_callback` won't fire for code objects whose LINE tracing
+  was disabled at their first PY_START. We have to override that
+  decision at the kernel level.
+- **`_next_code_line_in` MUST use `code.co_lines()`**, not arithmetic
+  (`f_lineno + 1`). Blank/synthetic lines have no LINE events, so a
+  bp installed there sits inert and the pause is silently dropped.
+- **For real frames at the mutating line, use `f_lasti` first.**
+  Source order can point backward inside already-executed multi-line
+  statements. `_next_code_line_after_frame` is what keeps
+  `openapi_validate_request` from arming an impossible bp at line 106.
+  It also rejects backward-pointing lines (`line > current_line` guard)
+  and exception-handler lines.
+- **Cleanup runs on EVERY sessionPaused.** Not just watchpoint pauses –
+  any pause (manual breakpoints, manual pause button, exception
+  breakpoints, ...). This ensures bp leaks self-heal: if a session
+  ends abnormally and no `_pycharm_consume_last_hit` runs, the bps
+  die with the process (pydevd's state is per-process).
+- **Negative bp_ids prevent collision with pydevd's IDE bps.** The
+  IDE assigns positive integer IDs. Hashing `(watch_name, file, line)`
+  to a negative ID gives us a unique handle without polluting that
+  range.
+
+Tests:
+- `test_next_code_line_finds_actual_code_line_skipping_blanks` – pins
+  the blank-line case via `co_lines()`-based skip.
+- `test_handle_hit_uses_bytecode_next_line_for_multiline_attr_assignment`
+  – pins the `request.parsed = ParsedRequest(...)` case where numeric
+  source order points into already-executed RHS lines.
+- `test_next_code_line_after_frame_skips_handler_only_lines` – pins the
+  exception-handler-line skip.
+- `test_next_code_line_after_frame_rejects_backward_line` – pins the
+  backward-pointing RETURN_CONST line rejection (v21 fix for
+  `_authorization` line 288 → line 287 regression).
+- `test_next_slot_for_code_never_returns_mutation_line_or_earlier` – pins
+  the `max(used_lines, start_line)` guard (v21 fix).
+
+### 14. Magic-number caps moved to named constants (all 1024)
+
+Six inline literals that capped runaway scenarios were extracted to
+three named constants and bumped to 1024 each:
+
+- `_MAX_HIT_QUEUE_SIZE` (was `256` in `_handle_hit`) – cap on
+  `WatchpointRegistry._hit_queue` before dropping oldest entries.
+  With the dedupe gate this is normally 0-or-1, so the cap only
+  matters for test paths or pathological bypass scenarios.
+- `_MAX_PROPAGATION_QUEUE_SIZE` (was `128` in `_on_call`) – per-thread
+  cross-function propagation queue cap. CALL events queue here
+  waiting for the matching PY_START to consume.
+- `_MAX_FRAME_WALK_HOPS` (was `32` in `_find_user_caller`,
+  `_find_user_code_caller`, and `_pause_via_pydevd`'s disarm loop) –
+  max f_back hops before giving up. 1024 matches Python's default
+  recursion limit – above that you'd hit `RecursionError` from the
+  interpreter before us.
+
+All three are "should never hit in practice; if you do, something is
+genuinely pathological" limits. Pulled into named constants so a
+single edit covers all sites if a future use case exceeds them.
+
+### 15. `_wp_container_repr` must be safe against repr-raising values
+
+The container wrappers (`_WatchedList`, `_WatchedDict`, `_WatchedSet`)
+snapshot before-and-after reprs in every mutating method to detect
+change. The repr path goes through `_wp_container_repr(self)`, which
+delegates to the BASE type's `__repr__` (`list.__repr__` / etc.) and
+that recursively reprs every contained value.
+
+If any contained value's `__repr__` raises, the whole snapshot raises,
+and the exception propagates out of our `__setitem__` / `append` / etc.
+into the user's code that triggered the mutation. **This kills user
+code that was working fine before we wrapped its container.**
+
+The user-reported scenario: watch `self` on a Django `TestCase`. The
+recursive walker wraps `self._testdata_memo` (a plain dict) as
+`_WatchedDict`. Django then passes that dict as `memo` to
+`copy.deepcopy(...)`. Deepcopy's `memo[id(x)] = y` flow calls our
+`__setitem__` while `y` is a half-reconstructed Django Model whose
+`__repr__` accesses `_state` (not yet restored) → AttributeError →
+test fails through no fault of the user.
+
+Fix: `_wp_container_repr` wraps the entire repr path in try/except
+and returns `"<unreprable>"` on any exception. Same-string before-
+and-after means no hit fires, but the underlying mutation succeeds.
+
+**Guarantees to preserve**:
+
+- **ALL `dict.__repr__(self)` / `list.__repr__(self)` / `set.__repr__(self)`
+  calls inside the wrappers MUST go through `_wp_container_repr(self)`.**
+  Direct calls to the base type's `__repr__` bypass the try/except
+  and re-introduce the bug. There are 33 such call sites (every
+  mutating method on every wrapper class) – all converted.
+- **The `repr(value)` fallback at the end of `_wp_container_repr` also
+  needs the try/except.** Some custom objects override `__repr__` and
+  raise.
+- **Trade-off**: when contained values can't be repr'd, we can't
+  detect changes via repr-diff. Those mutations are silent. In
+  practice this only happens for mid-construction objects (deepcopy,
+  pickle.load, `__setstate__`) which aren't typically the mutations
+  the user cares about.
+
+Tests:
+- `test_watched_dict_setitem_swallows_value_repr_errors` (the Django
+  TestCase scenario)
+- `test_watched_list_mutations_swallow_value_repr_errors` (symmetric)
+- `test_watched_set_mutations_swallow_value_repr_errors` (symmetric)
+
+### 16. Module-load fingerprint + file-based diagnostic log
+
+Two debugging affordances added during a long debugging session and
+kept because they're cheap and load-bearing for bug reports:
+
+**`_RUNTIME_VERSION`** is a string at module load that gets logged
+via `_log_warn` once on import. When a user reports "I rebuilt the
+plugin and it still doesn't work," the first thing to check is
+whether the version stamp in their log matches the latest code.
+This distinguishes "fix didn't help" from "you're running a stale
+build." Bump the version string on every meaningful behavioral
+change to the runtime.
+
+**`_log_warn` tees to `/tmp/pythonwatchpoint.log`.** Under pytest's
+default capture mode, stderr is hidden – `[WATCHPOINT] ...` lines
+never reach the user's terminal or Debug Console. Pydevd's
+stdout/stderr interception can also rewrite or drop lines. The
+file sink at a fixed path (NOT env-driven – one less moving part
+for users to set up) is the durable log the user can `tail -f`
+during a session.
+
+File-size guard: when the file grows past 2 MB, we truncate to the
+last 1 MB on next write. Bounds growth over long sessions without
+losing recent history.
+
+Both are surfaced unconditionally; there's no production-vs-debug
+toggle. The cost is one syscall + one timestamp formatting per
+log line, which is negligible compared to anything else the
+runtime does.
+
+### 17. Direct-pause dispatch via `_bp_pause_pending` (v13)
+
+Belt-and-suspenders mechanism for the `_install_pause_breakpoint` path.
+After installing a `LineBreakpoint` via pydevd's `consolidate_breakpoints`
+and force-arming `LINE | PY_RETURN` on the target code object with
+`sys.monitoring.set_local_events(DEBUGGER_ID, ...)`, the runtime ALSO
+registers the `(id(target_code), line)` key in
+`WatchpointRegistry._bp_pause_pending` and arms the same events under
+our OWN `_TOOL_ID`'s monitoring slot.
+
+Why: in PEP 669 mode, pydevd's `py_start_callback` can return `DISABLE`
+for code objects that had no breakpoints at their first entry. Even
+though we later arm events with `set_local_events(DEBUGGER_ID, ...)`,
+pydevd's internal `py_line_callback` may not fire for the current
+invocation – the `DISABLE` decision from the first PY_START predates
+our bp install. Our OWN tool's `_on_line` fires independently (it has
+no prior `DISABLE` history for any code object) and checks
+`_bp_pause_pending` on every LINE event. When the key matches, it pops
+the entry and calls `_trigger_direct_pause` – which does
+`py_db.do_wait_suspend(...)` directly (rule-1 trade-off accepted here
+because the alternative is silent no-pause). The IDE pauses immediately.
+
+Pipeline:
+1. `_install_bp_at` registers `(id(target_code), line)` in
+   `_bp_pause_pending` after `consolidate_breakpoints` succeeds.
+2. `_on_line` checks `(id(code), line_number)` at the top of every
+   LINE callback, before the normal local-watch diff logic.
+3. On match: pop the entry (prevents double-fire on re-entrant calls),
+   call `_trigger_direct_pause(code, line_number)`.
+4. `_trigger_direct_pause` locates `py_db`, finds the current thread's
+   frame at the code+line location, and calls `do_wait_suspend`.
+5. Cleanup: `_pycharm_consume_last_hit` clears `_bp_pause_pending`
+   entries for drained hits. `clear_watches()` clears all entries.
+
+Guarantees to preserve:
+- **Pop before dispatch.** If `_trigger_direct_pause` itself triggers
+  a LINE event on the same code (e.g. via pydevd's protocol code),
+  the entry is already gone – no infinite loop.
+- **Best-effort.** `_trigger_direct_pause` catches all exceptions
+  gracefully (pydevd not loaded, thread gone, etc.). The primary bp
+  path through pydevd's own `py_line_callback` is still the intended
+  path; this is the backup.
+- **Cleanup on drain.** Stale entries in `_bp_pause_pending` that
+  were never reached (the primary pydevd path fired first, or the
+  code line was never executed) are cleared when the hit is consumed
+  or when `clear_watches()` runs.
+
+Tests:
+- `test_install_bp_registers_in_bp_pause_pending`
+- `test_on_line_dispatches_direct_pause_for_pending_bp`
+- `test_on_line_ignores_non_pending_lines`
+- `test_consume_clears_bp_pause_pending_for_drained_hits`
+
+### 18. Installation side-effect suppression (`_installing_watch_thread`) (v14)
+
+When `watch("obj")` is called, `_instrument_object_tree` walks the
+object's `__dict__` calling `getattr(obj, attr_name)` for each entry
+and installing class surgery / container wraps on nested values. Some
+objects have lazy-evaluation semantics: reading an attribute triggers a
+side-effect write to another attribute (Django's `SimpleLazyObject`,
+ORMs with lazy-loading descriptors, cached properties that populate
+backing fields). These side-effect writes go through our freshly-
+installed `__setattr__` hook and would fire a spurious `WatchpointHit`
+during the installation – confusing because the user hasn't mutated
+anything yet.
+
+**Fix:** a module-level `_installing_watch_thread: Optional[int]` flag
+is set to `threading.get_ident()` around the `_registry.add_watch()`
+call in both `watch()` and `watch_at()`. `_handle_hit` checks this
+flag at the top: if the current thread's ident matches, the hit is
+silently dropped (early return before queueing or pausing).
+
+Key design decisions:
+- **Thread-scoped, not a simple bool.** The IDE's evaluator thread
+  calls `watch_at()` while user threads may be running. A simple
+  `True/False` flag would suppress legitimate user-thread mutations
+  that happen concurrently with installation. The thread-ident
+  comparison ensures only the installing thread's side-effects are
+  suppressed.
+- **`finally`-guarded clearing.** Both `watch()` and `watch_at()`
+  wrap `add_watch()` in `try/finally` with
+  `_installing_watch_thread = None` in the `finally`. This prevents
+  the flag from leaking if `add_watch` raises (e.g. slotted class,
+  frozen dataclass). A leaked flag would permanently suppress all
+  future hits on that thread.
+- **Baseline is NOT discarded by suppression.** When the
+  `__setattr__` hook fires during installation, the assignment still
+  executes (via `super().__setattr__`). The object's actual state
+  reflects the side-effect. The `_value_hash` baseline captured at
+  arm-time is whatever the object holds POST-installation, so a
+  subsequent real assignment of the SAME value is correctly silent
+  (the baseline matches current), and a genuinely different value
+  fires.
+- **Complements, does not replace, the `_guard` mechanism.** The
+  per-thread `_guard.active` flag handles re-entrancy from WITHIN
+  the watcher's own `__setattr__` (e.g. our container-wrap setattr
+  during `_instrument_object_tree`). `_installing_watch_thread`
+  handles the broader case: side-effect writes that happen OUTSIDE
+  the guard window but still during the installation flow (e.g. a
+  property getter that writes a backing attribute before the guard
+  is set for that particular iteration step).
+
+Tests:
+- `test_handle_hit_suppressed_during_installation` – SimpleLazyObject
+  scenario
+- `test_installing_watch_flag_cleared_on_exception` – flag doesn't
+  leak on slotted/failing objects
+- `test_installation_suppression_thread_scoped` – other threads still
+  fire during installation
+- `test_installation_suppression_same_thread_does_suppress` – same
+  thread is silent
+- `test_multiple_watches_in_sequence_each_suppresses_independently` –
+  sequential watch() calls each work correctly
+- `test_suppression_does_not_discard_baseline` – same-value check
+  uses post-installation state as baseline
+- `test_suppression_only_active_during_installation_window` – flag
+  cleared immediately after watch() returns
 
 ## The pydevd pause – tread carefully
 
@@ -408,6 +951,85 @@ Trade-offs:
   clobber `step_cmd` / `step_stop`. In practice this can't happen because
   stepping implies the thread is paused (so user code isn't executing).
 
+### PEP 669 supplement – force-arm pydevd's monitoring on user_frame + caller
+
+The scoped-step-over flow above relies on `set_trace_for_frame_and_parents`
+to arm `f_trace` on `user_frame` and its callers so pydevd's tracer fires
+on their next line / return events. Under sys.settrace that's enough.
+**Under sys.monitoring (PEP 669) it isn't.** pydevd's tracer is only
+dispatched when an event is enabled on the relevant code object's
+`set_local_events` mask for `DEBUGGER_ID` (tool 0), and
+`set_trace_for_frame_and_parents` has several silent early-return paths
+where it doesn't touch the monitoring mask at all (PEP 669 mode, filtered
+files, certain pydevd builds).
+
+The user-visible bug this caused: when the watched mutation is the **last
+statement of a helper function**, e.g. `order.status = "paid"` as the only
+line of `charge_card` in the test_demo_b demo. After our `__setattr__`
+returns, `charge_card` has no more lines to fire a LINE event on, and
+without `PY_RETURN` enabled on its code object pydevd never learns it
+returned. The next watch hit overwrites `step_stop` and the pause
+materialises only for the LAST of N back-to-back hits ("stops 2 times for
+3 mutations"). Adding a `pass` after the assignment "fixes" it because
+that creates the follow-up LINE event pydevd was waiting for.
+
+The supplement, after the f_trace plumbing, calls `sys.monitoring.set_local_events`
+on `DEBUGGER_ID` (= 0) for **two** code objects with **two** events:
+
+```python
+debugger_tool_id = sys.monitoring.DEBUGGER_ID  # 0
+wanted = sys.monitoring.events.LINE | sys.monitoring.events.PY_RETURN
+
+# user_frame.f_code: LINE for "next line in this function" stepping;
+# PY_RETURN for the "no follow-up line, function just returned" case.
+existing = sys.monitoring.get_local_events(debugger_tool_id, user_frame.f_code)
+sys.monitoring.set_local_events(
+    debugger_tool_id, user_frame.f_code, existing | wanted,
+)
+
+# user_frame.f_back.f_code: same events. After PY_RETURN completes the
+# step-over, the pause needs a landing site – the caller's next LINE event.
+# Without LINE armed there, pydevd's tracer never fires when the caller
+# resumes after the helper returns, and the pause is silently dropped.
+f_back = user_frame.f_back
+if f_back is not None:
+    existing_back = sys.monitoring.get_local_events(debugger_tool_id, f_back.f_code)
+    sys.monitoring.set_local_events(
+        debugger_tool_id, f_back.f_code, existing_back | wanted,
+    )
+```
+
+Why OR with the existing mask: pydevd may already have events armed on
+these code objects (e.g. a breakpoint in user_frame's caller). Overwriting
+with just our two would silently clear pydevd's own events.
+
+Why include `PY_RETURN` on `f_back.f_code` too: symmetry. If the caller is
+ALSO the last-line-of-a-helper case (chained one-liner helpers calling
+each other), pydevd needs to see the caller's unwind too. The bit is cheap
+and covers a class of edge cases without needing to walk the whole stack.
+
+Why we don't walk deeper than `f_back`: the assumption is that at least
+ONE frame between `user_frame` and the top of the user's stack has a
+line after the watched call – the typical pattern is a multi-line caller
+(loop, sequence of calls) that's interested in inspecting state across
+several mutation sites. If the user's *entire* call stack is one-liner
+helpers all the way to the top, the pause still happens; it just lands
+in whichever frame finally has a follow-up LINE event. Walking the whole
+stack would arm events on dozens of unrelated code objects for marginal
+benefit.
+
+Tool ID gotcha: if pydevd hasn't claimed `DEBUGGER_ID` (older Python,
+sys.settrace mode), `set_local_events(0, ...)` raises `ValueError`. The
+supplement catches all exceptions silently because in that scenario the
+scoped-step-over above is enough on its own – the supplement is a strict
+addition for the PEP 669 mode case.
+
+Regression test:
+`test_pause_via_pydevd_enables_line_and_py_return_on_user_and_caller_frames`
+claims `DEBUGGER_ID` itself (impersonating pydevd), calls `_pause_via_pydevd`
+through a real call chain, and asserts both code objects have both events
+enabled afterwards.
+
 ### Looking up the pydevd debugger
 
 `_get_pydevd_debugger()` prefers `_pydevd_bundle.pydevd_constants.GlobalDebuggerHolder.global_dbg`
@@ -464,7 +1086,10 @@ paused frame (the eval happens in a separate context). `_find_paused_user_frame`
 walks every thread's stack via `sys._current_frames()` and matches by
 `co_name == func_hint` + multiple file-suffix comparisons (absolute /
 `/private/var/...` prefixes / basename) so it works across macOS path
-quirks. Test: `test_watch_at_locates_paused_frame_in_other_thread`.
+quirks. When multiple candidates match (recursion), it picks the
+**innermost** (deepest) frame – this matches PyCharm's typical "currently
+executing frame" focus. Tests: `test_watch_at_locates_paused_frame_in_other_thread`,
+`test_watch_at_prefers_innermost_recursive_frame`.
 
 ## What lives where in `watchpoint.py`
 
@@ -480,7 +1105,7 @@ quirks. Test: `test_watch_at_locates_paused_frame_in_other_thread`.
 | `WatchpointRegistry._try_classpatch_object_watch` | Classpatch wildcard fallback for bare-name watches when subclassing fails. Installs a `'__any__'` entry so any attribute write on this instance fires under `f"{expr}.{attr}"`. Does NOT recurse – the recursive walker is unused on the classpatch path. |
 | `WatchpointRegistry._install_single_object_watch` | Per-object class-surgery installer. Used by `_add_object_watch` for the root AND by `_instrument_object_tree` for every nested user-defined object. Returns an `_AttributeWatch` the caller either registers in `_attr_watches` (root) or appends to `root.sub_watches` (nested). Does NOT use classpatch fallback – only the top-level dispatch in `add_watch` does. |
 | `WatchpointRegistry._make_any_attr_watcher_class` | Constructs the `_WatchedAnyAttrSubclass(original_cls)` with closure-captured `_expr` + `_root_expr`. Its `__setattr__` fires `_handle_hit`, wraps container values, recursively instruments newly-assigned user objects (under the same `_root_expr`). |
-| `WatchpointRegistry._instrument_object_tree` | Recurses `obj.__dict__` to depth `_RECURSIVE_OBJECT_WATCH_DEPTH = 4`. Cycle-guarded by a per-call visited-id set. Records each nested sub-instrumentation in `root_watch.sub_watches`. |
+| `WatchpointRegistry._instrument_object_tree` | Recurses `obj.__dict__` to depth `_RECURSIVE_OBJECT_WATCH_DEPTH = 4`. Cycle-guarded by `root_watch.visited_ids` (persistent across the initial walk AND every later `__setattr__`-triggered re-entry). Filters via `_is_user_defined_type` (skip framework / stdlib / site-packages types) and `isinstance(value, type)` (skip class objects). Records each nested sub-instrumentation in `root_watch.sub_watches` via `_try_add_sub_watch` (breadth-cap-respecting). |
 | `WatchpointRegistry._undo_attr_watch_payload` | Reverses one `_AttributeWatch`'s instrumentation (un-wraps its container if any, restores `obj.__class__` if any). Shared by root + sub-watch cleanup. |
 | `WatchpointRegistry._on_line` / `_on_py_return` / `_on_py_start` | sys.monitoring callbacks. PY_START also picks up cross-function propagations. |
 | `WatchpointRegistry._on_call`     | CALL callback. Snapshots watched locals and queues a propagation for the callee. Skips lazy-body callees (gen/coro/asyncgen) and non-Python callables. |
@@ -499,10 +1124,26 @@ quirks. Test: `test_watch_at_locates_paused_frame_in_other_thread`.
 | `_wrap_container` / `_unwrap_container` | Constructors / inverse: wrap a list/dict/set in the right `_Watched*` subclass; produce a plain copy back from a wrapper on cleanup. |
 | `_wp_fire_container_change`       | Container-side firing path. Reads `_wp_registry` / `_wp_expr` from the wrapper's `__dict__`; null `_wp_registry` is the "dead" signal that user code holding a leaked wrapper alias must respect. |
 | `_RECURSIVE_OBJECT_WATCH_DEPTH`   | Recursion cap (4). Depth-N attrs ARE instrumented; depth-(N+1) recursion returns early. |
+| `_MAX_SUB_WATCHES_PER_ROOT`       | Breadth cap (100). `_try_add_sub_watch` flips `root_watch.sub_watches_capped` and logs a one-time warning when reached. Belt-and-suspenders against cyclic graphs the type filter + visited set miss. |
+| `_FRAMEWORK_MODULE_ROOTS`         | Frozenset of top-level module names (`django`, `sqlalchemy`, `pydevd`, `_pydevd_bundle`, `numpy`, `pandas`, `pydantic`, `werkzeug`, `flask`, `pytest`, `setuptools`, `_pycharm_watchpoint`, `watchpoint`, ...) whose types are framework code. Consulted by `_is_user_defined_type`. Both `_pycharm_watchpoint` (IDE runtime module name) and `watchpoint` (test-mode file import) are listed. |
+| `_is_user_defined_type`           | Returns True iff `t` is a type from user code – rejects `builtins`, `sys.stdlib_module_names` roots, `_FRAMEWORK_MODULE_ROOTS` roots, and any module whose `__file__` lives under `site-packages` / `dist-packages`. Used to gate recursive instrumentation; the root object the user passes is unaffected (it goes through `add_watch`'s own dispatch). |
+| `_try_add_sub_watch`              | Appends a sub-watch unless the per-root cap is reached. First time the cap engages on a given root, logs one warning naming the root expression. |
+| `_RUNTIME_FILENAMES`              | Frozenset of filenames whose frames are runtime code (`"<string>"` for the sitecustomize-exec'd module; this file's `__file__` for tests). `_find_user_caller` walks past frames matching either to find the real caller, so hits report the user's mutation line instead of `super().__setattr__` inside `_WatchedAnyAttrSubclass`. |
+| `_find_user_caller`               | Walks `f_back` from a starting frame past `_RUNTIME_FILENAMES` until it finds a user frame, or returns None after 32 hops. Callers that get None must drop the hit – the mutation didn't originate from user code (e.g. descriptor side-effect during pydevd's variable-display call). |
 | `_safe_iter_dict_attrs`           | `obj.__dict__` iteration helper for `_instrument_object_tree`. Skips dunder names and silently no-ops on slotted classes. |
-| `_handle_hit`                     | Pause-via-pydevd or raise fallback.           |
+| `_handle_hit`                     | Three gates at the top: (1) `_installing_watch_thread` suppression – early-return if the hit is on the installing thread (side-effect from tree walk, see §18); (2) `_find_user_code_caller` existence check – drop silently if no user code anywhere in the chain; (3) compute bp targets via `_compute_bp_targets(user_frame)` – up to two slots (primary at mutation site + safety at walked-up user code), then install each via `_install_bp_at`. Falls back to `_pause_via_do_wait_suspend` only when ALL bp installs fail AND the queue was empty. `source_file/line` always points at the actual mutation site so the highlighter renders on the right line regardless of where the pause lands. Each hit gets its OWN bp at a successive code line (see §11). |
+| `_installing_watch_thread`        | Module-level `Optional[int]` – set to `threading.get_ident()` around `_registry.add_watch()` in `watch()` and `watch_at()`. Checked at the top of `_handle_hit`: if matching, the hit is silently dropped (side-effect from our own tree walk). Cleared in `finally` to prevent leaks. Thread-scoped so real mutations on other threads still fire during installation. See design contract §18. |
+| `WatchpointRegistry._bp_pause_pending` | `dict[(id(code), line): True]` – keyed by code-object identity + line number. Populated by `_install_bp_at` after `consolidate_breakpoints`. Checked at the top of `_on_line`: on match, the entry is popped and `_trigger_direct_pause` fires `do_wait_suspend`. Cleared per-hit in `_pycharm_consume_last_hit` and wholesale in `clear_watches()`. See design contract §17. |
+| `_trigger_direct_pause`           | Belt-and-suspenders pause: called from our `_on_line` when a `_bp_pause_pending` entry matches. Finds the current thread's frame at the target code+line and calls `py_db.do_wait_suspend(...)`. Best-effort: catches all exceptions. See design contract §17. |
+| `WatchpointRegistry._temp_breakpoints` | List of `(file, line, bp_id)` tuples for `LineBreakpoint`s installed by `_install_pause_breakpoint`. Removed in bulk in `_pycharm_consume_last_hit` (every sessionPaused, watchpoint or not). Negative bp_ids prevent collision with pydevd's IDE-assigned positive IDs. See design contract §13. |
+| `_is_library_filename`            | Path check on `co_filename`: matches `site-packages` / `dist-packages` (third-party) AND any path under `_STDLIB_DIR_PREFIX` (computed once from `os.__file__`'s directory at module load). Used by `_find_user_code_caller` to filter both library categories – pydevd's "do not step into library code" filter treats them identically, so anchoring on EITHER produces the same silent-pause-failure. **Override:** if a path falls under a directory listed in `PYCHARM_WATCHPOINT_USER_ROOTS` (env var, path-separator-delimited, set by the Kotlin launcher from `project.basePath`), it's treated as user code even if it's under `site-packages` – this supports editable-install workflows (`pip install -e .`). |
+| `_find_user_code_caller`          | Walks `f_back` past runtime AND library (site-packages / dist-packages / stdlib) frames to find the nearest user-code frame. Used by `_handle_hit` to anchor the pause on user code even when the watched mutation happened inside library code. Returns None if no user code is in the chain – callers drop the hit. See design contract §12. |
+| `_next_code_line_in`              | `code.co_lines()`-based lookup for the smallest line strictly greater than `after_line`. Returns None if no later code line exists in the code object (the function's body ends at or before `after_line`). Critical for `_install_pause_breakpoint` to avoid landing the bp on a blank line / line past the function's last statement, where no LINE event fires. See design contract §13. |
+| `_install_pause_breakpoint`       | Primary pause mechanism. Builds up to two candidates: user_frame's next code line, and f_back's next code line (if f_back is user code). For each, creates a `LineBreakpoint`, registers it via `py_db.consolidate_breakpoints`, AND forces `LINE | PY_RETURN` armed on the target code object via `sys.monitoring.set_local_events(DEBUGGER_ID, target_code, ...)`. Returns a list of `(file, line, bp_id)` tuples or empty list on failure. See design contract §13. |
+| `_remove_temp_breakpoints`        | Removes `LineBreakpoint`s previously installed by `_install_pause_breakpoint`. Best-effort: logs but doesn't raise on failure (leaked bps die with the process; not a correctness issue). |
+| `_pause_via_do_wait_suspend`      | Last-resort pause when `_install_pause_breakpoint` returns empty. Calls `py_db.set_suspend(thread, CMD_SET_BREAK)` + `py_db.do_wait_suspend(thread, frame, 'line', None)`. Blocks until the user resumes. Trade-off: `urllib.parse.quote` ends up on the user thread's stack (rule-1 from "The pydevd pause" §); the IDE shows urllib as topmost frame with the actual user frame below in the Frames panel. Used for the corner case where the mutation is at the last statement of a module/function AND there's no user-code caller above with a follow-up line. See design contract §13. |
 | `_get_pydevd_debugger`            | Robust lookup, multiple fallbacks.            |
-| `_pause_via_pydevd`               | Scoped step-over: `CMD_STEP_OVER` + `step_stop = user_frame` + `state = RUN`, plus direct `user_frame.f_trace = trace_dispatch` and a disarm loop on our own `<string>` frames. Pauses ONLY when pydevd's tracer hits a LINE event on `user_frame`, never on intervening codec / IO / `<string>` frames. |
+| `_pause_via_pydevd`               | LEGACY / FALLBACK: Scoped step-over: `CMD_STEP_OVER` + `step_stop = user_frame` + `state = RUN`, plus direct `user_frame.f_trace = trace_dispatch` and a disarm loop on our own `<string>` frames. Ends with the PEP 669 supplement that force-arms `LINE + PY_RETURN` on `user_frame.f_code` AND `user_frame.f_back.f_code` for pydevd's `DEBUGGER_ID` tool. Was the primary pause mechanism until PEP 669 mode proved it unreliable for arbitrary deep user frames (see design contract §13's rationale). Now kept as reference for a future pydevd version that might expose a public "pause at this deep frame" API. NOT called from `_handle_hit` anymore. |
 | `_is_object_watchable`            | Heuristic for the auto-detection in `add_watch`. |
 | `_value_hash`                     | Change-detection hash with type tag.          |
 | `_setup_monitoring`               | Claims a tool ID, registers callbacks (LINE / PY_RETURN / PY_START / CALL). Guarded against re-import. |
@@ -512,6 +1153,49 @@ quirks. Test: `test_watch_at_locates_paused_frame_in_other_thread`.
 - **Re-introduce a `_drop_dead_frame_watches` sweep in `_on_line`.** It looks
   natural ("clean up watches with mismatched fid") but it deletes concurrent
   live frames' watches.
+- **Re-introduce a global `_pause_pending` boolean gate ("dedupe back-to-back
+  hits to one pause").** The gate was removed in v8 because it silently
+  dropped hits 2..N. The 4-mutation auth-middleware case proved users want
+  one pause per mutation, not one pause per "perceived event". The
+  sequential-bps approach (`_compute_bp_targets` + `_next_slot_for_code`)
+  gives N pauses for N mutations – each with its own bp at a distinct code
+  line. If you see "two yellow lines simultaneously" again, the fix is in
+  the Kotlin-side highlighter (it should render only the hit matching the
+  current pause), NOT a gate that drops hits on the Python side.
+- **Drop the pause-anchor walk-up (`_find_user_code_caller` in
+  `_handle_hit`) ("the immediate `user_frame` is the right anchor").**
+  Without the walk-up, watched mutations inside framework code
+  (Django `QuerySet._clone()` setting `self._hints` / `self._query`,
+  SQLAlchemy session flush, pydantic model build) silently fail to
+  pause: PyCharm's "do not step into library code" filter causes
+  pydevd's `CMD_STEP_OVER + step_stop = library_frame` to be
+  short-circuited, and the cascade-via-PY_RETURN doesn't reach
+  user code either. The user-visible symptom is "watchpoint hit
+  fires (highlight + stderr log appear) but the debugger never
+  actually stops." Tests:
+  `test_handle_hit_anchors_pause_on_user_code_when_mutation_is_in_library`.
+- **Remove the stdlib filter from `_is_library_filename` ("user code
+  passing through stdlib helpers is still user code").** This was
+  the initial design and it was wrong. Pydevd's "do not step into
+  library code" filter treats stdlib the same as site-packages, so
+  anchoring `CMD_STEP_OVER` on a stdlib frame produces the same
+  silent-pause-failure as anchoring on a site-packages frame. The
+  user-reported case that proved this: `copy.deepcopy(qs)` on a
+  watched Django QuerySet. The watcher fires from
+  `django/query.py:289` (site-packages, skipped fine), the next
+  frame up is `copy.py:143` (stdlib), the walk-up landed there,
+  and the debugger never paused because pydevd's filter rejected
+  the stdlib anchor. Tests:
+  `test_find_user_code_caller_walks_past_stdlib`,
+  `test_find_user_code_caller_handles_deepcopy_through_django_chain`.
+- **On `_find_user_code_caller` returning None, fall back to the
+  immediate `user_frame` and pause there anyway.** It looks like the
+  right "best effort" thing to do – "we tried our best, pause
+  somewhere" – but it brings back the exact bug we just fixed:
+  pause on a library frame, filter swallows it, phantom highlight
+  with no real pause. Dropping silently is the correct behavior
+  when there's no user code to anchor on. Test:
+  `test_handle_hit_drops_when_chain_is_entirely_library`.
 - **Call `do_wait_suspend` directly to "pause right here".** It puts urllib
   into the call stack. Use the scoped step-over pattern in `_pause_via_pydevd`.
 - **Set `info.pydev_message`.** Same urllib pause path.
@@ -535,13 +1219,95 @@ quirks. Test: `test_watch_at_locates_paused_frame_in_other_thread`.
   loop is largely belt-and-suspenders, but cheap and removes one category
   of potential failure. Regression test:
   `test_pause_via_pydevd_disarms_own_frames_to_keep_user_frame_topmost`.
+- **Drop `PY_RETURN` from the PEP 669 supplement, or skip the supplement's
+  `f_back` arm.** Both are load-bearing for the last-line-of-helper case
+  (the test_demo_b "stops 2 times for 3 mutations" symptom):
+  `PY_RETURN` on `user_frame.f_code` is how pydevd learns the function
+  returned when the watched mutation was the last statement; LINE on
+  `user_frame.f_back.f_code` is the pause's landing site once that return
+  fires. Dropping either re-introduces the silent-pause-drop bug for any
+  helper whose final action is the watched mutation – which is the natural
+  shape of demo / DTO setter / late-binding wiring code. Regression test:
+  `test_pause_via_pydevd_enables_line_and_py_return_on_user_and_caller_frames`.
+- **Drop the broad `except Exception:` around the PEP 669 supplement.** Under
+  sys.settrace mode (older Python or pydevd builds without monitoring
+  support), `sys.monitoring.use_tool_id` was never called for `DEBUGGER_ID`,
+  so `get_local_events(0, ...)` raises `ValueError: tool ID is not in use`.
+  The except is what keeps that path silent – the scoped-step-over above
+  is enough on its own without the supplement.
 - **Register `PY_UNWIND` globally for cleanup.** It works but kills the
   zero-overhead guarantee.
+- **Switch the primary pause mechanism back to `_pause_via_pydevd`
+  (`CMD_STEP_OVER + step_stop`).** It looks elegant – it's literally
+  what `pydevd.settrace(stop_at_frame=...)` does internally. But it
+  silently fails in PEP 669 mode whenever the pause anchor is a code
+  object whose `py_start_callback` decided "no LINE tracing needed"
+  at the function's FIRST entry (i.e., file had no breakpoints at
+  that moment). `restart_events()` re-fires armed events; it doesn't
+  fabricate a fresh PY_START to re-evaluate. The `LineBreakpoint`
+  path in `_install_pause_breakpoint` works because pydevd's
+  `py_line_callback` checks `py_db.breakpoints[file]` directly
+  without depending on the per-function "should-trace" decision.
+  Plus the `set_local_events` step we layered on top forces events
+  armed at the kernel level so pydevd's callback actually gets
+  invoked. Keep `_pause_via_pydevd` as a reference / future fallback
+  if pydevd ever exposes a real public API for "pause at this deep
+  frame," but don't use it as the primary path. See design contract §13.
+- **Skip the `set_local_events(LINE | PY_RETURN)` call after
+  `consolidate_breakpoints` in `_install_pause_breakpoint`.**
+  `consolidate_breakpoints` clears the skip caches and calls
+  `restart_events()` in PEP 669 mode, which LOOKS sufficient – but
+  `restart_events` only re-fires events that are already armed.
+  For a function that's currently mid-execution and was set up
+  without LINE tracing on first entry, LINE events stay disabled.
+  The bp lives in pydevd's table but `py_line_callback` never fires
+  for the current invocation. `set_local_events` on the target code
+  object is what forces LINE events armed at the kernel level,
+  bypassing pydevd's internal "should we trace this code object"
+  bookkeeping. See design contract §13.
+- **Use `f_lineno + 1` instead of `_next_code_line_in(code, f_lineno)`
+  for the bp install line.** Blank lines, lines past the last
+  statement, and lines between statements have NO bytecode and no
+  LINE events. A bp at such a line is inert: pydevd's
+  `py_line_callback` is never invoked for it because no event ever
+  fires. The user-reported `set_accessible_products` case is exactly
+  this: the function ends on line 195, line 196 is blank, bp at 196
+  silently never fires, IDE never pauses. `code.co_lines()` returns
+  only ACTUAL code lines – use it. See design contract §13 and the
+  `test_next_code_line_finds_actual_code_line_skipping_blanks` test.
+- **Remove the `_pause_via_do_wait_suspend` last-resort fallback
+  ("we should never use do_wait_suspend, rule 1 said so").** Rule 1
+  is the right default. But when `_install_pause_breakpoint` returns
+  empty AND there's no user-code caller above with a next code line
+  (the `script.py` last-line-of-module case), the only alternative
+  is silent no-pause on a deliberate `watch(...)`. The user explicitly
+  asked the debugger to break on the change – honoring that with an
+  ugly stack (urllib on top, user frame at the bottom of the call
+  stack panel) is better UX than ignoring the request. The fallback
+  fires only in this corner case; the clean bp path covers
+  everything else.
+- **Drop the bare-`__repr__` calls from `_wp_container_repr`'s
+  explicit-type paths (the `list.__repr__(value)` / `dict.__repr__(value)` /
+  `set.__repr__(value)` branches before the generic fallback).**
+  The fallback `repr(value)` is already wrapped in try/except; the
+  explicit-type branches MUST also be inside that try/except. If
+  any contained value's `__repr__` raises, `dict.__repr__(self)`
+  propagates that exception out of our `__setitem__`, out of the
+  user's `deepcopy` / `pickle` / etc., killing their code. The
+  Django TestCase + `_testdata_memo` user-reported case is exactly
+  this. See design contract §15.
+- **Snapshot the container with `dict.__repr__(self)` (or
+  `list.__repr__(self)`, `set.__repr__(self)`) directly inside the
+  mutating methods, bypassing `_wp_container_repr`.** Same trap as
+  above – any contained value with a raising `__repr__` (half-built
+  Django Model, custom `__repr__` that touches uninitialized state)
+  blows up `__setitem__`. ALL 33 mutating-method snapshots go
+  through `_wp_container_repr(self)` for the try/except guard.
 - **Use `weakref` on a frame.** Frames are not weakly referenceable in CPython
   (confirmed empirically on 3.12/3.13/3.14).
 - **Hold `self._lock` while calling `_handle_hit`.** Pause would freeze every
   other thread's `watch()` calls.
-- **Remove the raise fallback in `_handle_hit`.** The 121-test suite depends
+- **Remove the raise fallback in `_handle_hit`.** The test suite depends
   on it for the no-pydevd environment.
 - **Drop the `_LAZY_BODY_FLAGS` check in `_on_call`.** Generator / coroutine /
   async-generator function calls return their iterable WITHOUT entering the
@@ -612,6 +1378,87 @@ quirks. Test: `test_watch_at_locates_paused_frame_in_other_thread`.
   during a pause – the same trap the in-class `__setattr__` overrides
   in `_WatchedSubclass` / `_WatchedAnyAttrSubclass` were designed to
   avoid. The guard is shared across all three paths for the same reason.
+- **Drop the `_is_user_defined_type` filter in `_instrument_object_tree`
+  / `_WatchedAnyAttrSubclass.__setattr__`'s re-entry path.** Without it,
+  watching a user DTO that references a Django QuerySet recurses into
+  the QuerySet, then into its `.model` (a Django Model CLASS, not
+  instance), then through every FK descriptor on that class. Django's
+  descriptors fabricate FRESH proxy instances on each access, so the
+  per-id() cycle detection never matches, and reading those
+  descriptors does internal setattrs as a side effect, retriggering
+  our watcher in an unbounded loop. End result: hundreds of queued
+  hits per Variables-panel expansion + frozen IDE. Test:
+  `test_recursion_stops_at_framework_boundary`. The filter has TWO
+  legs (the `_FRAMEWORK_MODULE_ROOTS` denylist AND the
+  `site-packages` / `dist-packages` path heuristic); keep both.
+- **Drop the `isinstance(value, type)` filter and trust the metaclass
+  conflict TypeError to catch class objects.** It does catch them (a
+  watcher subclass of `_Inner` can't replace `_Inner.__class__`,
+  which is `type`), so behaviorally removing the filter doesn't break
+  the regression test. But the filter saves us from constructing the
+  watcher subclass + running through `_install_single_object_watch`'s
+  full setup before the TypeError lands. Cheaper to reject upfront.
+  Test: `test_recursion_skips_class_objects`.
+- **Use a per-call `visited` set in `_instrument_object_tree`.** The
+  set MUST live on `root_watch.visited_ids` and be shared across the
+  initial walk AND every later `__setattr__`-triggered re-entry.
+  Pre-fix, each `__setattr__` call into the watcher re-entered with
+  `visited={id(wrapped_value)}` – a fresh set that didn't carry the
+  ids the initial walk already covered. Combined with Django's
+  fabricated-on-each-access proxy instances, every assignment
+  restarted a depth-4 walk that wasn't bounded by cycle detection.
+  Test: `test_visited_ids_shared_across_setattr_reentry`.
+- **Drop the breadth cap (`_try_add_sub_watch`) and let sub_watches
+  grow without bound.** Belt-and-suspenders against the cycles the
+  type filter + visited set miss. If a user-defined class has cyclic
+  proxy semantics like Django's ORM, the cap stops the explosion
+  before pydevd's hit queue overflows. Test:
+  `test_breadth_cap_engages_with_warning`.
+- **Drop `_find_user_caller` and fire hits with `sys._getframe(1)`
+  directly.** The `<string>` runtime frame may be ABOVE the user's
+  frame in the chain (it usually is, since the watcher's
+  `__setattr__` IS the runtime), but sometimes the entire chain
+  consists of runtime + descriptor side-effects on a pydevd worker
+  thread – no user frame at all. Firing a hit in that case reports
+  `<string>:NNN` as the source location and floods pydevd's queue,
+  triggering "Trying to stop on non-existent thread" SEVEREs in the
+  IDE log. Tests: `test_find_user_caller_walks_past_runtime_frames`,
+  `test_find_user_caller_returns_none_for_empty_chain`.
+- **Drop the guard around `obj.__class__ = watcher_cls` in
+  `_install_single_object_watch`.** When this method is called
+  recursively from `_instrument_object_tree` for a nested attribute,
+  the holder already has a watcher class installed. The `__class__`
+  swap on `obj` would propagate up to the holder's `__setattr__`
+  watcher and queue a spurious hit at `<string>:549` (the line of the
+  assignment in this file). The guard keeps the swap silent.
+- **Replace `_installing_watch_thread` with a simple boolean.** A plain
+  `True/False` flag would suppress mutations on ALL threads, including
+  legitimate user-thread writes that happen concurrently with the IDE's
+  evaluator calling `watch_at()`. The thread-ident comparison scopes
+  suppression to the installing thread only. Test:
+  `test_installation_suppression_thread_scoped`.
+- **Replace `_installing_watch_thread` with a counter (to handle nested
+  `watch()` calls).** Nested `watch()` inside a `__setattr__` is
+  theoretically possible but nearly impossible in practice because the
+  `_guard.active` flag prevents re-entry through the watcher's hook,
+  and `_instrument_object_tree` uses `_guard.active = True` around its
+  own setattr calls. A counter adds complexity without covering a real
+  scenario. If nested `watch()` ever becomes real, the correct fix is
+  making `_installing_watch_thread` a per-thread counter in a
+  `threading.local()`, not a global counter.
+- **Move the `_installing_watch_thread` check below the
+  `_find_user_caller` walk in `_handle_hit`.** The suppression check
+  MUST be the first gate: `_find_user_caller` walks `f_back` which can
+  trigger frame access on descriptors, potentially causing more side-
+  effect writes. Checking `_installing_watch_thread` first is both
+  cheaper (one int compare) and prevents cascading re-entry.
+- **Remove `_bp_pause_pending` cleanup from `_pycharm_consume_last_hit`
+  ("let them die naturally when _on_line fires").** Stale entries that
+  were never reached (the primary pydevd bp path fired first, or the
+  code line was simply never executed) would accumulate forever, and
+  a future execution of the same code+line would spuriously trigger
+  `_trigger_direct_pause` – a phantom pause from a prior session's
+  watchpoint. Cleanup on consume is what keeps this self-healing.
 
 ## Diagnostics for live debug sessions
 
@@ -712,14 +1559,57 @@ reintroduce the symptom and call it a fix.
   Mutations beyond that level don't fire. Tests:
   `test_recursive_watch_depth_cap` (no fire) and
   `test_recursive_watch_depth_at_cap_still_fires` (just-inside fires).
+- **Recursive object-watch has a breadth cap too.**
+  `_MAX_SUB_WATCHES_PER_ROOT = 100`. Once a root accumulates 100
+  sub-watches the cap engages, `root_watch.sub_watches_capped` flips
+  to True, and a one-line `[WATCHPOINT]` warning is logged naming
+  the root. Belt-and-suspenders against any cyclic / framework-shaped
+  graph the type filter + visited set miss. Test:
+  `test_breadth_cap_engages_with_warning`.
 - **Slotted classes aren't recursed into.** `_safe_iter_dict_attrs`
   silently no-ops on objects without `__dict__`. The slotted object's own
   direct attr changes still fire (class surgery catches `__setattr__`),
   but its slotted attrs' nested objects aren't auto-discovered.
+- **Framework / stdlib / site-packages types aren't recursed into.**
+  When watching a user DTO that holds a Django QuerySet / SQLAlchemy
+  session / `pathlib.Path` / etc., we instrument the DTO fully but
+  stop at the framework boundary – the framework object itself is
+  left untouched. This is INTENTIONAL: without it, watching a Django
+  QuerySet causes hundreds of queued hits per Variables-panel
+  expansion as Django's descriptors fabricate fresh proxy instances
+  on each access (cycle detection by `id()` never matches) and
+  reading those descriptors does internal setattrs as a side effect,
+  re-triggering our watcher in an unbounded loop. The user can still
+  watch the framework value directly – `watch("queryset")` arms
+  classpatch (if the metaclass allows) or local-variable rebind
+  detection, both of which catch what the user actually cares about
+  (rebinds of their local) without instrumenting ORM internals.
+  See `_FRAMEWORK_MODULE_ROOTS` / `_is_user_defined_type` for the
+  heuristic. Tests:
+  `test_recursion_stops_at_framework_boundary`,
+  `test_is_user_defined_type_rejects_known_frameworks`,
+  `test_is_user_defined_type_rejects_stdlib_modules`,
+  `test_is_user_defined_type_rejects_site_packages_heuristic`.
+- **Class objects aren't recursed into.** If a user attribute holds a
+  reference to a class (e.g. `self.registry_cls = SomeClass`), we don't
+  walk the class's `__dict__` – it's full of descriptors (properties,
+  classmethods, ORM relationship descriptors) that would each get
+  instrumented and trigger explosive growth. The class itself is left
+  untouched; the user's attribute REBIND on `self.registry_cls` still
+  fires because the holder is watched. Test:
+  `test_recursion_skips_class_objects`.
+- **Hits originating from runtime frames are dropped.** When a
+  descriptor side-effect or a debugger-protocol attribute access
+  triggers our watcher's `__setattr__` from a frame chain entirely
+  inside `<string>` (the runtime's exec'd module), `_find_user_caller`
+  returns None and the hit is silently discarded rather than queued.
+  Without this filter, the IDE's Variables-panel expansion would flood
+  pydevd's hit queue with `<string>:NNN` lines. Test:
+  `test_find_user_caller_returns_none_for_empty_chain`.
 
 ## Test layout (`test_watchpoint.py`)
 
-Organized in roughly eleven bands (121 tests):
+Organized in roughly thirteen bands (171 tests):
 
 1. **Basics** – fire on change, old/new values, source line, unwatch, clear,
    multiple watches.
@@ -771,6 +1661,43 @@ Organized in roughly eleven bands (121 tests):
     (recursion doesn't auto-classpatch), `_StubbornDjangoLikeMeta` for
     the truly-unpatchable path (dotted raises TypeError, bare-name
     falls back to local-variable rebind).
+12. **v13 direct-pause dispatch** – `test_compute_bp_targets_*`,
+    `test_install_bp_registers_in_bp_pause_pending`,
+    `test_on_line_dispatches_direct_pause_for_pending_bp`,
+    `test_on_line_ignores_non_pending_lines`,
+    `test_consume_clears_bp_pause_pending_for_drained_hits`:
+    belt-and-suspenders mechanism where our own `_TOOL_ID`'s `_on_line`
+    triggers `do_wait_suspend` when pydevd's DEBUGGER_ID callback
+    doesn't fire (the f_back-intermediate walk-up for last-line
+    mutations, the `_bp_pause_pending` dict, and its cleanup on
+    consume/clear).
+13. **Installation side-effect suppression** –
+    `test_handle_hit_suppressed_during_installation`,
+    `test_installing_watch_flag_cleared_on_exception`,
+    `test_installation_suppression_thread_scoped`,
+    `test_installation_suppression_same_thread_does_suppress`,
+    `test_multiple_watches_in_sequence_each_suppresses_independently`,
+    `test_suppression_does_not_discard_baseline`,
+    `test_suppression_only_active_during_installation_window`,
+    `test_watch_obj_then_watch_dotted_both_fire`,
+    `test_getattr_side_effect_suppressed_during_tree_walk`,
+    `test_overlapping_watch_obj_x_then_obj_fires_on_x`:
+    the `_installing_watch_thread` flag that silences side-effect
+    mutations triggered by our own tree walk during `watch()` setup,
+    plus overlapping-watch scenarios verifying stacked class-surgery
+    doesn't break either watcher.
+14. **Hit payload caller info (secondary highlight)** –
+    `test_hit_payload_includes_caller_file_and_line`,
+    `test_caller_walks_to_bp_file_through_intermediates`,
+    `test_caller_walk_same_file_as_primary_bp`,
+    `test_caller_fallback_when_no_frame_matches_bp_file`:
+    the `caller_file` / `caller_line` fields (6 and 7) in the hit
+    payload, populated by the frame-walk-to-bp-file logic in
+    `_handle_hit`. After `_compute_bp_targets` returns, walks up from
+    `user_frame.f_back` looking for a frame in the same file as
+    `targets[0][0]`; if found, uses that frame's `f_lineno` as the
+    call-site line. Falls back to `f_back` when no ancestor matches.
+    The Kotlin side uses this for the secondary "call-site" highlight.
 
 Tests use a helper-inner-function pattern (`def _code(): ...; with
 pytest.raises(WatchpointHit): _code()`) because of the 3.14 LINE-exception

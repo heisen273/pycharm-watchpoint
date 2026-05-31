@@ -7,14 +7,15 @@ import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
-import com.intellij.xdebugger.XDebugProcess
 import com.intellij.xdebugger.XDebuggerManager
 import com.intellij.xdebugger.evaluation.XDebuggerEvaluator
-import com.intellij.xdebugger.frame.XStackFrame
 import com.intellij.xdebugger.frame.XValue
+import com.intellij.xdebugger.impl.XDebugSessionImpl
+import com.intellij.xdebugger.impl.frame.XDebugView
 import com.intellij.xdebugger.impl.ui.tree.XDebuggerTree
 import com.intellij.xdebugger.impl.ui.tree.actions.XDebuggerTreeActionBase
 import com.intellij.xdebugger.impl.ui.tree.nodes.XValueNodeImpl
+import com.jetbrains.python.debugger.PyDebugProcess
 import com.jetbrains.python.debugger.PyDebugValue
 import com.jetbrains.python.debugger.PyStackFrame
 import com.pythonwatchpoint.listeners.WatchpointTreeCellRenderer
@@ -93,11 +94,7 @@ class AddWatchpointAction : AnAction() {
         if (nodes.isEmpty()) return
 
         val session = XDebuggerManager.getInstance(project).currentSession ?: return
-        // Accept any XDebugProcess (PyDebugProcess for pydevd, PythonDapDebugProcess for
-        // debugpy). The previous `as? PyDebugProcess ?: return` silently swallowed the
-        // entire action under debugpy – no log, no notification, no eval.
-        val debugProcess = session.debugProcess
-        logger.warn("AddWatchpointAction.actionPerformed: debugProcess=${debugProcess::class.simpleName}")
+        val debugProcess = session.debugProcess as? PyDebugProcess ?: return
         val service = WatchpointMarkerService.getInstance(project)
 
         // Dedupe by path so two tree rows pointing at the same logical
@@ -127,62 +124,16 @@ class AddWatchpointAction : AnAction() {
         // own sys._getframe() stack is the WRONG one to use here.
         val currentFrame = session.currentStackFrame
         val frameFile = currentFrame?.sourcePosition?.file?.path
-        // Func name: pydevd's PyStackFrame exposes `.name` directly; debugpy's
-        // DapXStackFrame uses a different class hierarchy. We try the typed cast
-        // first, then fall back to reflection so we work under any XStackFrame
-        // subclass that happens to expose a name-ish property.
-        val frameFuncName = currentFrame?.let(::extractFrameName)
-        logger.warn("Resolved frame: file=$frameFile, func=$frameFuncName, frameType=${currentFrame?.let { it::class.simpleName }}")
-        if (frameFile == null) {
-            notify(project, "Cannot add watchpoint: no current Python frame (file unavailable)", NotificationType.ERROR)
+        val frameFuncName = (currentFrame as? PyStackFrame)?.name
+        if (frameFile == null || frameFuncName == null) {
+            notify(project, "Cannot add watchpoint: no current Python frame", NotificationType.ERROR)
             return
         }
-
-        // Empty string is the runtime's "match by file only" signal – worse than
-        // having the func name (more chance of multiple candidates on recursion),
-        // but lets debugpy users with no name resolution still arm watches.
-        val funcHint = frameFuncName ?: ""
 
         // In a mixed selection, only arm the unwatched ones – the already-
         // watched ones stay armed (user can issue an explicit Remove later).
         pairs.filterNot { service.isWatched(it.second) }
-            .forEach { (node, path) -> addWatchpoint(project, debugProcess, node, path, frameFile, funcHint) }
-    }
-
-    /**
-     * Best-effort extraction of the function name from a paused stack frame.
-     * pydevd exposes [PyStackFrame.name]; debugpy's DAP stack frame uses a
-     * different class entirely, so we fall back to common JavaBean getter names
-     * via reflection. Returns null if nothing usable surfaces – the caller can
-     * still arm a watch with file-only matching.
-     */
-    private fun extractFrameName(frame: XStackFrame): String? {
-        (frame as? PyStackFrame)?.name?.takeIf { it.isNotEmpty() }?.let { return it }
-        // Reflection fallback for DAP / future frame impls. Walk the class
-        // hierarchy and try both public methods (`getMethod`) and any-visibility
-        // declared methods (`getDeclaredMethod` + setAccessible), since Kotlin
-        // backing fields can end up package-private under some compiler settings.
-        val candidates = listOf("getName", "getFunctionName", "getMethodName")
-        var cls: Class<*>? = frame.javaClass
-        while (cls != null) {
-            for (methodName in candidates) {
-                val method = try {
-                    cls.getDeclaredMethod(methodName).also { it.isAccessible = true }
-                } catch (_: NoSuchMethodException) {
-                    null
-                }
-                if (method != null) {
-                    try {
-                        val value = method.invoke(frame) as? String
-                        if (!value.isNullOrEmpty()) return value
-                    } catch (e: Exception) {
-                        logger.warn("extractFrameName: ${cls?.simpleName}.$methodName threw ${e.message}")
-                    }
-                }
-            }
-            cls = cls.superclass
-        }
-        return null
+            .forEach { (node, path) -> addWatchpoint(project, debugProcess, node, path, frameFile, frameFuncName) }
     }
 
     /**
@@ -191,47 +142,41 @@ class AddWatchpointAction : AnAction() {
      * paused frame across threads (the evaluator's frame stack doesn't
      * include user code – see runtime CLAUDE.md).
      *
-     * Success is observed by a non-"ERROR" return value. We do **not**
+     * Success is observed by a non-"ERROR:" return value. We do **not**
      * fire a success notification – the row icon swap done by
      * [WatchpointTreeCellRenderer] is the visible "this is now watched"
      * signal, and stacking a popup on top of it is redundant noise.
      */
     private fun addWatchpoint(
         project: Project,
-        debugProcess: XDebugProcess,
+        debugProcess: PyDebugProcess,
         node: XValueNodeImpl,
         fullPath: String,
         frameFile: String,
         frameFuncName: String,
     ) {
-        logger.warn("Arming watchpoint on '$fullPath' in '$frameFuncName' ($frameFile)")
+        logger.warn("Arming watchpoint on '$fullPath' in $frameFuncName ($frameFile)")
 
-        // Escape single-quotes defensively (Windows paths, unusual identifiers).
-        val escFullPath = fullPath.replace("'", "\\'")
-        val escFile = frameFile.replace("'", "\\'")
-        val escFunc = frameFuncName.replace("'", "\\'")
-        val expr = "_pycharm_watch_at('$escFullPath', '$escFile', '$escFunc')"
+        val expr = "_pycharm_watch_at(" +
+            "${pythonStringLiteral(fullPath)}, " +
+            "${pythonStringLiteral(frameFile)}, " +
+            "${pythonStringLiteral(frameFuncName)})"
 
         debugProcess.evaluator?.evaluate(expr, object : XDebuggerEvaluator.XEvaluationCallback {
             override fun evaluated(result: XValue) {
-                // Under pydevd we can read PyDebugValue.value to get the actual Python
-                // return string. Under debugpy the result is a DAP-specific XValue
-                // subclass whose toString() comes back empty, so PyDebugValue.value
-                // is unreachable. We optimistically decorate the row when no error
-                // arrived on either path – the runtime's own stderr trace
-                // ([WATCHPOINT/dbg] watch_at: add_watch returned ...) is the source
-                // of truth for "watch armed successfully".
-                val rawValue = (result as? PyDebugValue)?.value
-                if (rawValue != null && rawValue.contains("ERROR")) {
+                // PyDebugValue.toString() returns the EXPRESSION text shown in
+                // the Variables tree (the row name), NOT the evaluated value.
+                // Use PyDebugValue.value for the actual Python return.
+                val rawValue = (result as? PyDebugValue)?.value ?: result.toString()
+                if (rawValue.startsWith("ERROR:")) {
                     notify(project, "Watchpoint failed: $rawValue", NotificationType.ERROR)
                     return
                 }
-                logger.warn("Watchpoint arm eval returned: ${rawValue ?: "<no readable value – check Debug Console for runtime trace>"}")
                 ApplicationManager.getApplication().invokeLater {
                     decorateNode(project, node.tree, fullPath)
                     // Re-fetch all variables so the row's type/repr reflects the new
                     // `_WatchedAny_<Class>` wrapper instead of the original cached `<Class>`.
-                    XDebuggerManager.getInstance(project).currentSession?.rebuildViews()
+                    refreshVariablesView(project)
                 }
             }
             override fun errorOccurred(errorMessage: String) {
@@ -246,24 +191,22 @@ class AddWatchpointAction : AnAction() {
      * (no return value), so we treat any non-error eval as success and
      * undecorate the row.
      *
-     * After the unwatch lands, we also call `XDebugSession.rebuildViews()` to
-     * force the Variables panel to re-fetch the variable's repr. Without
-     * this, the panel keeps showing the stale `_WatchedAny_<Class>` /
-     * `_Watched<Class>` subclass name (and the wrapped-container types like
-     * `_WatchedList`) until the next step / breakpoint hit naturally
-     * re-fetches. The runtime has already restored `__class__` on the live
-     * object – this is purely a PyCharm side cache-invalidation issue, and
-     * `rebuildViews()` is the public API for "re-query everything".
+     * After the unwatch lands, we refresh the Variables panel to re-fetch the
+     * variable's repr. Without this, the panel keeps showing the stale
+     * `_WatchedAny_<Class>` / `_Watched<Class>` subclass name (and the
+     * wrapped-container types like `_WatchedList`) until the next step /
+     * breakpoint hit naturally re-fetches. The runtime has already restored
+     * `__class__` on the live object – this is purely a PyCharm-side
+     * cache-invalidation issue.
      */
     private fun removeWatchpoint(
         project: Project,
-        debugProcess: XDebugProcess,
+        debugProcess: PyDebugProcess,
         node: XValueNodeImpl,
         fullPath: String,
     ) {
         logger.warn("Removing watchpoint on '$fullPath'")
-        val escFullPath = fullPath.replace("'", "\\'")
-        val expr = "_pycharm_unwatch('$escFullPath')"
+        val expr = "_pycharm_unwatch(${pythonStringLiteral(fullPath)})"
 
         debugProcess.evaluator?.evaluate(expr, object : XDebuggerEvaluator.XEvaluationCallback {
             override fun evaluated(result: XValue) {
@@ -272,7 +215,7 @@ class AddWatchpointAction : AnAction() {
                     // Re-fetch all variables so the row's type/repr reflects
                     // the now-restored __class__ instead of the stale
                     // `_WatchedAny_<Class>` snapshot from before unwatch.
-                    XDebuggerManager.getInstance(project).currentSession?.rebuildViews()
+                    refreshVariablesView(project)
                 }
             }
             override fun errorOccurred(errorMessage: String) {
@@ -280,6 +223,36 @@ class AddWatchpointAction : AnAction() {
                 notify(project, "Could not remove watchpoint on $fullPath: $errorMessage", NotificationType.ERROR)
             }
         }, null)
+    }
+
+    /**
+     * Refresh only the Variables panel without touching the Frames panel.
+     *
+     * `session.rebuildViews()` dispatches a FRAME_CHANGED event to ALL debug
+     * views (variables, frames, watches), which causes the Frames panel to
+     * reset its selection to the topmost frame – losing the user's scroll
+     * position. Instead, we send the event only to the Variables view so
+     * variable repr/type is re-fetched while the frame selection stays put.
+     */
+    private fun refreshVariablesView(project: Project) {
+        val session = XDebuggerManager.getInstance(project).currentSession as? XDebugSessionImpl ?: return
+        val variablesView = session.sessionTab?.variablesView ?: return
+        variablesView.processSessionEvent(XDebugView.SessionEvent.FRAME_CHANGED, session)
+    }
+
+    /**
+     * Return a single-quoted Python literal for evaluator calls.
+     *
+     * Backslashes must be escaped before quotes: Windows paths like
+     * `C:\Users\me\app.py` otherwise contain Python unicode escape prefixes
+     * such as `\U`, and the evaluator rejects the whole command before the
+     * runtime sees it.
+     */
+    private fun pythonStringLiteral(value: String): String {
+        val escaped = value
+            .replace("\\", "\\\\")
+            .replace("'", "\\'")
+        return "'$escaped'"
     }
 
     /**

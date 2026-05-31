@@ -21,7 +21,7 @@ repositories {
 
 dependencies {
     intellijPlatform {
-        pycharm("2026.1")
+        pycharmCommunity("2025.1")
         bundledPlugin("PythonCore")
 
         pluginVerifier()

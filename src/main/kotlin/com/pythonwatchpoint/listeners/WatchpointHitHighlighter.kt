@@ -1,10 +1,7 @@
 package com.pythonwatchpoint.listeners
 
-import com.intellij.execution.process.ProcessAdapter
-import com.intellij.execution.process.ProcessEvent
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.diagnostic.Logger
-import com.intellij.openapi.util.Key
 import com.intellij.openapi.editor.Editor
 import com.intellij.openapi.editor.EditorCustomElementRenderer
 import com.intellij.openapi.editor.Inlay
@@ -14,19 +11,18 @@ import com.intellij.openapi.editor.markup.HighlighterLayer
 import com.intellij.openapi.editor.markup.HighlighterTargetArea
 import com.intellij.openapi.editor.markup.RangeHighlighter
 import com.intellij.openapi.editor.markup.TextAttributes
+import com.intellij.openapi.editor.ScrollType
 import com.intellij.openapi.fileEditor.FileEditorManager
-import com.intellij.openapi.fileEditor.OpenFileDescriptor
+import com.intellij.openapi.fileEditor.TextEditor
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Disposer
 import com.intellij.openapi.vfs.LocalFileSystem
 import com.intellij.ui.JBColor
 import com.intellij.util.Alarm
 import com.intellij.util.ui.JBUI
-import com.intellij.xdebugger.XDebugProcess
 import com.intellij.xdebugger.XDebugSession
 import com.intellij.xdebugger.XDebugSessionListener
 import com.jetbrains.python.debugger.PyDebugProcess
-import com.pythonwatchpoint.services.WatchpointSessionManager
 import java.awt.Color
 import java.awt.Font
 import java.awt.Graphics
@@ -58,18 +54,15 @@ import java.util.Base64
 class WatchpointHitHighlighter(
     private val project: Project,
     private val session: XDebugSession,
-    // Passed in directly because `session.debugProcess` is lateinit-uninitialized
-    // at construction time under debugpy (`PythonDapDebugProcess`) – touching it
-    // throws NPE before the session is fully wired up. Going through the
-    // explicit reference avoids that race.
-    private val debugProcess: XDebugProcess,
 ) : XDebugSessionListener {
     private val logger = Logger.getInstance(WatchpointHitHighlighter::class.java)
 
-    // Multiple highlights at once: a single pause can coalesce several hits if
-    // they fire on consecutive lines (e.g. inside a function with no
-    // intermediate non-mutation lines). We render all of them and clear them
-    // all on the next sessionResumed.
+    // A single pause may need to render multiple highlights: the runtime
+    // queues every hit and the IDE drains the whole queue per pause, so
+    // mutations that fire in fast-returning sibling functions all show up
+    // even though pydevd's `CMD_STEP_OVER` mechanism coalesces them into one
+    // pause UI event. All entries are cleared together on the next
+    // sessionResumed / sessionStopped.
     private val currentHighlights: MutableList<HighlightHandle> = mutableListOf()
 
     // Set to true the first (and only) time `dispose()` is called. After that
@@ -84,7 +77,7 @@ class WatchpointHitHighlighter(
         val editor: Editor,
         val highlighter: RangeHighlighter,
         val inlay: Inlay<*>?,
-        val pulseAlarm: Alarm,
+        val pulseAlarm: Alarm?,
     )
 
     private data class HitInfo(
@@ -93,6 +86,8 @@ class WatchpointHitHighlighter(
         val name: String,
         val old: String,
         val new: String,
+        val callerFile: String,
+        val callerLine: Int,
     )
 
     // ---- pulse animation tunables ----
@@ -109,326 +104,113 @@ class WatchpointHitHighlighter(
     private val peakLight = Color(255, 140, 50)
     private val peakDark = Color(190, 145, 30)
 
-    // Buffer for the most recent `[WATCHPOINT/event]<base64>` line emitted by
-    // the runtime to stderr. Updated by [markerListener]; consumed (set to
-    // null) by [sessionPaused] when used as the data source under debugpy.
-    //
-    // Why a buffer instead of consuming directly inside the listener: the
-    // listener fires from a background thread on every stderr chunk, but the
-    // UI rendering must happen from sessionPaused (which is the actual debug
-    // event we attach to). Two events arriving close together is fine – the
-    // newer one overwrites the older, which matches the runtime's
-    // `_last_hit` single-slot semantics.
-    @Volatile
-    private var pendingMarkerEncoded: String? = null
-
-    // Stderr can arrive in fragments – debugpy's launcher sometimes splits
-    // long lines around buffer boundaries. We accumulate a per-stream tail
-    // until we see a newline, then process complete lines only. Map keyed by
-    // outputType (Key<String>) keeps stderr and stdout fragments separate.
-    private val streamTails = java.util.concurrent.ConcurrentHashMap<Key<*>, StringBuilder>()
-
-    private val markerListener = object : ProcessAdapter() {
-        override fun onTextAvailable(event: ProcessEvent, outputType: Key<*>) {
-            if (disposed) return
-            val text = event.text
-            if (text.isEmpty()) return
-            val tail = streamTails.computeIfAbsent(outputType) { StringBuilder() }
-            tail.append(text)
-            // Process every complete line; keep any trailing partial in the tail.
-            while (true) {
-                val nl = tail.indexOf('\n')
-                if (nl < 0) break
-                val line = tail.substring(0, nl)
-                tail.delete(0, nl + 1)
-                handleLine(line)
-            }
-        }
-
-        private fun handleLine(line: String) {
-            val trimmed = line.trim()
-            if (!trimmed.startsWith(MARKER_PREFIX)) return
-            pendingMarkerEncoded = trimmed.substring(MARKER_PREFIX.length).trim()
-        }
-    }
-
-    init {
-        // Attach to the user-process's stderr/stdout stream so we can buffer
-        // hit markers without going through the evaluator round-trip.
-        // Safe to attach even if the process has already started: ProcessHandler
-        // delivers an `onTextAvailable` for every subsequent chunk; we miss the
-        // (typically empty at this point) backlog before us, which is fine
-        // because hits can only happen after sessionStarted finishes anyway.
-        //
-        // Uses the directly-passed [debugProcess] (NOT `session.debugProcess`):
-        // under debugpy the session's process reference isn't initialized yet
-        // at our construction time, and accessing it throws a NPE that swallows
-        // the attach silently.
-        try {
-            val handler = debugProcess.processHandler
-            if (handler == null) {
-                logger.warn("WatchpointHitHighlighter: processHandler null at init – marker listener not attached")
-            } else {
-                handler.addProcessListener(markerListener)
-                logger.warn("WatchpointHitHighlighter: marker listener attached to ${handler::class.simpleName}")
-            }
-        } catch (e: Exception) {
-            logger.warn("Could not attach process marker listener: ${e::class.simpleName}: ${e.message}")
-        }
-    }
+    // Secondary highlight (call-site/pause line): very pale amber, static –
+    // visually distinct from the primary so the user reads it as "breadcrumb"
+    // rather than "mutation site."
+    private val secondaryLight = Color(255, 235, 180)
+    private val secondaryDark = Color(70, 60, 20)
 
     override fun sessionPaused() {
         if (disposed) return
-        logger.warn("WatchpointHitHighlighter.sessionPaused: backend=${debugProcess::class.simpleName}")
+        val debugProcess = session.debugProcess as? PyDebugProcess ?: return
 
-        // Two data sources:
-        //   1. pydevd: synchronous PyDebugProcess.evaluate('_pycharm_consume_last_hit()',
-        //      doTrunc=false). Returns the full untruncated base64 payload.
-        //   2. debugpy (or any backend without PyDebugProcess): file-based per-process
-        //      hit JSON, plus a `[WATCHPOINT/event]<base64>` stderr marker as fallback.
+        // Snapshot the current pause location on the EDT before hopping off
+        // for the synchronous evaluator call. The Python side filters its
+        // hit queue by `(pause_file, pause_line)` so each pause returns
+        // only the hit whose bp fired here – sibling hits whose bps are
+        // armed at OTHER lines stay queued for their own future pauses.
         //
-        // We try (1) first to keep behavior identical under pydevd, then fall back
-        // to (2). Both ultimately produce a HitInfo through the same decode path.
-        // Drain queued hits from the JSON-lines file. Same path under pydevd and
-        // debugpy – the runtime appends one line per hit, we read & delete the
-        // whole file in one pass. Multiple hits coalesced into a single pause
-        // (consecutive mutations with no intervening non-mutation lines) all
-        // render.
+        // If the position isn't available (rare race during session
+        // teardown or before the first stack frame is resolved), fall
+        // back to the legacy no-arg call which drains everything. The
+        // worst case is the original "two yellow lines at once" symptom
+        // for a single pause, which is still better than no highlight.
+        val sourcePosition = session.currentStackFrame?.sourcePosition
+        val pauseFile = sourcePosition?.file?.path
+        val pauseLine = sourcePosition?.line?.plus(1)  // line is 0-based; Python is 1-based
+
+        // Why not the generic XDebuggerEvaluator: that path returns a PyDebugValue
+        // whose `value` field is the variables-panel DISPLAY string, truncated to
+        // PyDebugValue.MAX_VALUE (256 chars). Our base64 payload routinely exceeds
+        // that – even the file path alone can be >150 base64 chars on macOS test
+        // trees – so the payload arrived chopped mid-field and decode silently
+        // failed. PyDebugProcess.evaluate(expr, execute=false, doTrunc=false)
+        // bypasses the truncation and returns the full string.
         //
-        // ProcessListener is async on a background thread; the runtime flushes
-        // before `_pause_via_pydevd` returns, but the IDE-side dispatch is
-        // decoupled. Poll briefly for the file to materialize.
+        // The call is synchronous and goes through pydevd's protocol, so we run
+        // it on a pooled thread; the UI work hops back to the EDT via invokeLater.
         ApplicationManager.getApplication().executeOnPooledThread {
-            var attempt = 0
-            while (attempt < 5 && !disposed) {
-                val hits = readHitsFromFile()
-                if (hits.isNotEmpty()) {
-                    logger.warn("sessionPaused: ${hits.size} hit(s) resolved from FILE on attempt #$attempt")
-                    // Drop any stream-buffered marker too – the file is authoritative.
-                    pendingMarkerEncoded = null
-                    ApplicationManager.getApplication().invokeLater {
-                        hits.forEach { applyHighlight(it) }
-                    }
-                    return@executeOnPooledThread
-                }
-                // Stderr marker as a secondary signal (single hit only; the
-                // file should always be the primary path going forward).
-                val markerHit = consumeBufferedMarker()
-                if (markerHit != null) {
-                    logger.warn("sessionPaused: hit resolved from STDERR MARKER on attempt #$attempt")
-                    ApplicationManager.getApplication().invokeLater { applyHighlight(markerHit) }
-                    return@executeOnPooledThread
-                }
-                attempt++
-                try {
-                    Thread.sleep(50)
-                } catch (e: InterruptedException) {
-                    return@executeOnPooledThread
-                }
-            }
-            logger.warn(
-                "sessionPaused: no hit data resolved after 250ms – treating as non-watchpoint pause. " +
-                "pendingMarkerEncoded=${pendingMarkerEncoded?.let { "len=${it.length}" } ?: "null"}"
-            )
-        }
-    }
-
-    /**
-     * Try to read and consume the per-process last-hit JSON file the runtime
-     * writes to `<tempdir>/pycharm_watchpoint_lasthit_<pid>.json`.
-     *
-     * The runtime uses `tempfile.gettempdir()` which resolves the same way as
-     * Java's `java.io.tmpdir` on macOS/Linux/Windows for processes started
-     * from the same shell environment – good enough across IDE-launched debug
-     * sessions. Atomic rename on the writer side guarantees we never read a
-     * half-written document.
-     */
-    /**
-     * Drain the JSON-lines hit file. Returns every hit that's been queued since
-     * the last pause and deletes the file – so consecutive mutations coalesced
-     * into one pause all render, instead of only the most recent.
-     *
-     * Empty list (or null) means no watchpoint pause is pending.
-     */
-    private fun readHitsFromFile(): List<HitInfo> {
-        val sessionDir = WatchpointSessionManager.getInstance(project).currentSessionTempDir()
-        if (sessionDir.isNullOrEmpty()) {
-            logger.warn("readHitsFromFile: no session temp dir registered")
-            return emptyList()
-        }
-        val file = java.io.File(sessionDir, "lasthit.json")
-        if (!file.exists()) return emptyList()
-        val lines = try {
-            file.readLines()
-        } catch (e: Exception) {
-            logger.warn("readHitsFromFile: read failed at $sessionDir: ${e.message}")
-            return emptyList()
-        }
-        try { file.delete() } catch (_: Exception) {}
-        val hits = lines.mapNotNull { line ->
-            val trimmed = line.trim()
-            if (trimmed.isEmpty()) null else parseHitJson(trimmed)
-        }
-        if (hits.isNotEmpty()) {
-            logger.warn("readHitsFromFile: drained ${hits.size} hit(s) from session dir $sessionDir")
-        }
-        return hits
-    }
-
-    private fun consumeBufferedMarker(): HitInfo? {
-        val encoded = pendingMarkerEncoded ?: return null
-        pendingMarkerEncoded = null
-        if (encoded.isEmpty()) return null
-        val hit = decodeHit(encoded)
-        if (hit == null) {
-            logger.warn("Watchpoint stream marker could not be decoded: $encoded")
-        }
-        return hit
-    }
-
-    private fun parseHitJson(text: String): HitInfo? {
-        // Minimal JSON parsing – just five known string/int fields. Using
-        // Gson or kotlinx-serialization would bring in a dependency we don't
-        // otherwise need; the format is fixed on the writer side so a hand
-        // parser is fine.
-        return try {
-            val map = simpleJsonObject(text) ?: return null
-            HitInfo(
-                file = map["file"] ?: return null,
-                line = map["line"]?.toIntOrNull() ?: return null,
-                name = map["name"] ?: return null,
-                old = map["old"] ?: "",
-                new = map["new"] ?: "",
-            )
-        } catch (e: Exception) {
-            logger.warn("parseHitJson failed: ${e.message}")
-            null
-        }
-    }
-
-    /**
-     * Tiny JSON-object parser. Handles the runtime's `json.dump` output for
-     * 5 known string/int fields. Not a general JSON parser – it only walks
-     * `{"key": "string-or-number-value", ...}` with `\\` escapes inside strings.
-     */
-    private fun simpleJsonObject(text: String): Map<String, String>? {
-        val s = text.trim()
-        if (!s.startsWith("{") || !s.endsWith("}")) return null
-        val body = s.substring(1, s.length - 1)
-        val map = mutableMapOf<String, String>()
-        var i = 0
-        while (i < body.length) {
-            while (i < body.length && body[i].isWhitespace()) i++
-            if (i >= body.length) break
-            if (body[i] == ',') { i++; continue }
-            // key
-            if (body[i] != '"') return null
-            val keyEnd = readJsonString(body, i) ?: return null
-            val key = unescapeJson(body.substring(i + 1, keyEnd))
-            i = keyEnd + 1
-            while (i < body.length && body[i].isWhitespace()) i++
-            if (i >= body.length || body[i] != ':') return null
-            i++
-            while (i < body.length && body[i].isWhitespace()) i++
-            // value: either a JSON string or a number (json.dump emits int for line)
-            if (i >= body.length) return null
-            val value = if (body[i] == '"') {
-                val end = readJsonString(body, i) ?: return null
-                val v = unescapeJson(body.substring(i + 1, end))
-                i = end + 1
-                v
+            if (disposed) return@executeOnPooledThread
+            val expr = if (pauseFile != null && pauseLine != null) {
+                // Escape backslashes + single quotes so the file path
+                // survives as a Python string literal.
+                val escaped = pauseFile.replace("\\", "\\\\").replace("'", "\\'")
+                "_pycharm_consume_last_hit('$escaped', $pauseLine)"
             } else {
-                val start = i
-                while (i < body.length && body[i] != ',' && !body[i].isWhitespace()) i++
-                body.substring(start, i)
+                "_pycharm_consume_last_hit()"
             }
-            map[key] = value
-        }
-        return map
-    }
+            val pyValue = try {
+                debugProcess.evaluate(expr, /* execute = */ false, /* doTrunc = */ false)
+            } catch (e: Exception) {
+                // Expected when this isn't a watchpoint session – the builtin
+                // simply isn't defined. Don't log to avoid spamming idea.log.
+                return@executeOnPooledThread
+            }
+            val raw = pyValue?.value ?: return@executeOnPooledThread
+            val payload = stripOuterQuotes(raw)
+            if (payload.isEmpty()) {
+                // Pause wasn't caused by a watchpoint – plain breakpoint, step, etc.
+                return@executeOnPooledThread
+            }
+            // Payload is one or more base64-encoded hit entries separated by `;`
+            // (see watchpoint.py `_pycharm_consume_last_hit`). Multiple entries
+            // occur when several mutations fired between consecutive pauses –
+            // each one becomes its own highlighted line.
+            val hits = payload.split(';').mapNotNull { entry ->
+                val trimmed = entry.trim()
+                if (trimmed.isEmpty()) null else decodeHit(trimmed)
+            }
+            if (hits.isEmpty()) {
+                logger.warn("Watchpoint hit payload could not be decoded: $raw")
+                return@executeOnPooledThread
+            }
+            if (hits.size > 1) {
+                logger.warn("sessionPaused: drained ${hits.size} queued watchpoint hits")
+            }
+            // Two-phase approach:
+            // Phase 1 (immediate): apply the highlight decoration so the
+            //   user sees the coloured line as soon as possible. If the
+            //   file is already open we grab its editor silently; if not
+            //   we open it (tab appears but IDE's own focus may override).
+            // Phase 2 (after 150ms): re-select the tab and scroll to the
+            //   line. The delay lets the IDE's post-pause focus settle
+            //   first so our tab selection wins and sticks.
+            ApplicationManager.getApplication().invokeLater {
+                if (disposed) return@invokeLater
+                hits.forEach { applyHighlight(it, jumpToLine = false) }
 
-    /** Find the closing quote of the JSON string starting at `s[start]`. */
-    private fun readJsonString(s: String, start: Int): Int? {
-        if (s[start] != '"') return null
-        var i = start + 1
-        while (i < s.length) {
-            when (s[i]) {
-                '\\' -> i += 2
-                '"' -> return i
-                else -> i++
-            }
-        }
-        return null
-    }
-
-    private fun unescapeJson(s: String): String {
-        if (!s.contains('\\')) return s
-        val sb = StringBuilder(s.length)
-        var i = 0
-        while (i < s.length) {
-            val c = s[i]
-            if (c != '\\' || i == s.length - 1) {
-                sb.append(c)
-                i++
-                continue
-            }
-            when (val next = s[i + 1]) {
-                '"', '\\', '/' -> sb.append(next)
-                'n' -> sb.append('\n')
-                't' -> sb.append('\t')
-                'r' -> sb.append('\r')
-                'b' -> sb.append('\b')
-                'f' -> sb.append('\u000C')
-                'u' -> {
-                    if (i + 5 < s.length) {
-                        try {
-                            sb.append(Integer.parseInt(s.substring(i + 2, i + 6), 16).toChar())
-                            i += 4
-                        } catch (e: NumberFormatException) {
-                            sb.append(next)
+                // Secondary highlight on the call-site line – a subtle
+                // breadcrumb so the user sees "the watchpoint fired inside this
+                // call" when they navigate back to the execution file. Uses the
+                // caller frame info captured by the Python runtime at hit time
+                // (the exact line that called into the code that mutated).
+                hits.forEach { hit ->
+                    if (hit.callerFile.isNotEmpty() && hit.callerLine > 0) {
+                        val sameLine = (hit.callerFile == hit.file && hit.callerLine == hit.line)
+                        if (!sameLine) {
+                            applySecondaryHighlight(hit)
                         }
-                    } else {
-                        sb.append(next)
                     }
                 }
-                else -> sb.append(next)
-            }
-            i += 2
-        }
-        return sb.toString()
-    }
 
-    /**
-     * Extract the OS PID of the user process from our debug process handler.
-     * Uses reflection so it doesn't bind to a specific ProcessHandler subclass
-     * (we've seen SimpleProcessHandler, OSProcessHandler, KillableProcessHandler,
-     * and various DAP-specific subclasses across IDE versions).
-     */
-    private fun extractProcessPid(): Long? {
-        val handler = debugProcess.processHandler ?: return null
-        return try {
-            val method = handler.javaClass.methods.firstOrNull {
-                it.name == "getProcess" && it.parameterCount == 0
+                // Phase 2: delayed jump ensures the tab sticks.
+                val jumpAlarm = Alarm(project)
+                jumpAlarm.addRequest({
+                    if (disposed) return@addRequest
+                    hits.forEach { jumpToHitLine(it) }
+                }, 150)
             }
-            if (method == null) {
-                logger.warn("extractProcessPid: ${handler.javaClass.simpleName} has no getProcess() method")
-                return null
-            }
-            val rawResult = method.invoke(handler)
-            val process = rawResult as? java.lang.Process
-            if (process == null) {
-                logger.warn("extractProcessPid: getProcess() returned ${rawResult?.javaClass?.name ?: "null"}")
-                return null
-            }
-            process.pid()
-        } catch (e: Exception) {
-            logger.warn("extractProcessPid: ${e::class.simpleName}: ${e.message}")
-            null
         }
-    }
-
-    private companion object {
-        private const val MARKER_PREFIX = "[WATCHPOINT/event]"
     }
 
     override fun sessionResumed() {
@@ -458,7 +240,9 @@ class WatchpointHitHighlighter(
 
     /**
      * Decode the payload produced by watchpoint.py's `_pycharm_consume_last_hit`:
-     * base64 of UTF-8 bytes whose decoded form is five NUL-separated fields.
+     * base64 of UTF-8 bytes whose decoded form is seven NUL-separated fields
+     * (file, line, name, old, new, caller_file, caller_line). Backward-compat
+     * with the legacy 5-field format (caller fields default to empty/0).
      * Returns null on any structural mismatch (truncated payload, missing
      * fields, non-numeric line, malformed base64), in which case the highlight
      * is silently skipped – we'd rather miss a marker than throw across the
@@ -468,14 +252,16 @@ class WatchpointHitHighlighter(
         return try {
             val rawBytes = Base64.getDecoder().decode(encoded)
             val raw = String(rawBytes, Charsets.UTF_8)
-            val parts = raw.split(' ')
-            if (parts.size != 5) return null
+            val parts = raw.split('\u0000')
+            if (parts.size < 5) return null
             HitInfo(
                 file = parts[0],
                 line = parts[1].toInt(),
                 name = parts[2],
                 old = parts[3],
                 new = parts[4],
+                callerFile = if (parts.size > 5) parts[5] else "",
+                callerLine = if (parts.size > 6) parts[6].toIntOrNull() ?: 0 else 0,
             )
         } catch (e: Exception) {
             null
@@ -489,10 +275,15 @@ class WatchpointHitHighlighter(
      *  - a gutter scrollbar mark + tooltip describing the change
      *  - an inline hint at the end of the line summarising the change
      *
-     * Replaces any previously-installed decoration first – we only ever want
-     * one watchpoint marker visible per session.
+     * Appends to the existing highlight set – multiple hits coalesced into one
+     * pause each get their own decoration, all cleared together on resume.
+     *
+     * @param jumpToLine if true, also selects the tab and scrolls to the line.
+     *   When false, only the decoration is applied (the file must already be open
+     *   or will be opened silently) – used for the immediate phase so the user
+     *   sees the highlight without waiting for the IDE's focus fight to settle.
      */
-    private fun applyHighlight(hit: HitInfo) {
+    private fun applyHighlight(hit: HitInfo, jumpToLine: Boolean = true) {
         // If the session ended while this call was queued on the EDT, skip –
         // otherwise we'd paint a highlight that nobody would ever clear.
         if (disposed) return
@@ -502,16 +293,38 @@ class WatchpointHitHighlighter(
             return
         }
 
-        // `focusEditor = false` preserves the debugger panel's focus so the
-        // user's Resume / Step keystrokes still go where they expect.
-        val descriptor = OpenFileDescriptor(project, vFile, (hit.line - 1).coerceAtLeast(0), 0)
-        val editor = FileEditorManager.getInstance(project).openTextEditor(descriptor, false) ?: return
+        val fileEditorManager = FileEditorManager.getInstance(project)
 
-        clearHighlightInternal()
+        // Try to get an editor without changing tab selection first. If the
+        // file isn't open yet, open it (which selects the tab – acceptable
+        // since the delayed jump will re-select anyway).
+        val editor = fileEditorManager.getEditors(vFile)
+            .filterIsInstance<TextEditor>().firstOrNull()?.editor
+            ?: fileEditorManager.openFile(vFile, /* focusEditor = */ false)
+                .filterIsInstance<TextEditor>().firstOrNull()?.editor
+            ?: return
 
         val lineCount = editor.document.lineCount
         if (lineCount == 0) return
-        val lineIndex = (hit.line - 1).coerceIn(0, lineCount - 1)
+        val lineIndex = hit.line - 1
+        // If the file was edited while the debug session is active, the hit line
+        // may exceed the current document length. Skip rather than clamping – a
+        // clamped highlight would decorate an unrelated line, which is confusing.
+        if (lineIndex < 0 || lineIndex >= lineCount) {
+            logger.warn("Watchpoint hit at ${hit.file}:${hit.line} is out of range (file has $lineCount lines) – skipping highlight")
+            return
+        }
+
+        if (jumpToLine) {
+            // Select the tab and scroll to the hit line.
+            fileEditorManager.openFile(vFile, /* focusEditor = */ false)
+            val scrollOffset = editor.document.getLineStartOffset(lineIndex)
+            editor.scrollingModel.scrollTo(
+                editor.offsetToLogicalPosition(scrollOffset),
+                ScrollType.CENTER,
+            )
+        }
+
         val startOffset = editor.document.getLineStartOffset(lineIndex)
         val endOffset = editor.document.getLineEndOffset(lineIndex)
 
@@ -540,6 +353,92 @@ class WatchpointHitHighlighter(
 
         currentHighlights.add(HighlightHandle(editor, highlighter, inlay, alarm))
         logger.warn("Highlighted ${hit.file}:${hit.line} for watchpoint '${hit.name}'")
+    }
+
+    /**
+     * Install a subtle static highlight on the call-site line – the line in the
+     * caller's code that invoked the function where the mutation happened. The
+     * Python runtime captures caller_file/caller_line from `f_lineno` of the
+     * nearest user-code caller frame at hit time, so this points at the exact
+     * call expression rather than guessing offsets from the bp fire location.
+     *
+     * Visually quieter than the primary: pale amber background, no pulse, no
+     * gutter mark, shorter inline hint. Serves as a breadcrumb linking the
+     * pause location to the watchpoint event.
+     */
+    private fun applySecondaryHighlight(hit: HitInfo) {
+        if (disposed) return
+        val vFile = LocalFileSystem.getInstance().findFileByPath(hit.callerFile) ?: return
+
+        val fileEditorManager = FileEditorManager.getInstance(project)
+        // The caller file is very likely already open (the IDE focused the
+        // pause file post-pause, which is typically at or near the caller).
+        val editor = fileEditorManager.getEditors(vFile)
+            .filterIsInstance<TextEditor>().firstOrNull()?.editor
+            ?: fileEditorManager.openFile(vFile, /* focusEditor = */ false)
+                .filterIsInstance<TextEditor>().firstOrNull()?.editor
+            ?: return
+
+        val lineCount = editor.document.lineCount
+        if (lineCount == 0) return
+        // callerLine is 1-based (Python f_lineno); convert to 0-based editor index.
+        val lineIndex = (hit.callerLine - 1).coerceIn(0, lineCount - 1)
+
+        val startOffset = editor.document.getLineStartOffset(lineIndex)
+        val endOffset = editor.document.getLineEndOffset(lineIndex)
+
+        val bg = JBColor(secondaryLight, secondaryDark)
+        val attrs = TextAttributes().apply { backgroundColor = bg }
+
+        val highlighter = editor.markupModel.addRangeHighlighter(
+            startOffset,
+            endOffset,
+            HighlighterLayer.SELECTION - 2,  // below primary highlight layer
+            attrs,
+            HighlighterTargetArea.LINES_IN_RANGE,
+        )
+
+        // Shorter inline hint – signals the call-site relationship without
+        // repeating the full old→new detail (that's on the primary line).
+        val hintText = "  <- watchpoint '${hit.name}' changed inside this call"
+        val inlay = try {
+            editor.inlayModel.addAfterLineEndElement(
+                endOffset,
+                /* relatesToPrecedingText = */ true,
+                WatchpointInlineHintRenderer(editor, hintText),
+            )
+        } catch (e: Exception) {
+            null
+        }
+
+        currentHighlights.add(HighlightHandle(editor, highlighter, inlay, /* pulseAlarm = */ null))
+        logger.warn("Secondary highlight at ${hit.callerFile}:${hit.callerLine} for watchpoint '${hit.name}'")
+    }
+
+    /**
+     * Phase 2 of the two-phase highlight: select the mutation file's tab and
+     * scroll to the hit line. Called after a short delay so the IDE's own
+     * post-pause focus has already settled and our tab selection sticks.
+     */
+    private fun jumpToHitLine(hit: HitInfo) {
+        if (disposed) return
+        val vFile = LocalFileSystem.getInstance().findFileByPath(hit.file) ?: return
+        val fileEditorManager = FileEditorManager.getInstance(project)
+        // openFile with focusEditor=false: selects the tab (makes file
+        // visible) without giving the editor keyboard focus – debug tool
+        // window keeps focus, no blinking caret.
+        val editor = fileEditorManager.openFile(vFile, /* focusEditor = */ false)
+            .filterIsInstance<TextEditor>().firstOrNull()?.editor ?: return
+
+        val lineCount = editor.document.lineCount
+        if (lineCount == 0) return
+        val lineIndex = hit.line - 1
+        if (lineIndex < 0 || lineIndex >= lineCount) return
+        val scrollOffset = editor.document.getLineStartOffset(lineIndex)
+        editor.scrollingModel.scrollTo(
+            editor.offsetToLogicalPosition(scrollOffset),
+            ScrollType.CENTER,
+        )
     }
 
     /**
@@ -637,14 +536,6 @@ class WatchpointHitHighlighter(
      */
     fun dispose() {
         disposed = true
-        // Detach the stderr marker listener; the ProcessHandler can outlive us
-        // during a hard "Stop debug" sequence, so leaving the listener attached
-        // would leak this whole highlighter instance.
-        try {
-            debugProcess.processHandler?.removeProcessListener(markerListener)
-        } catch (e: Exception) {
-            logger.warn("Could not remove process marker listener: ${e.message}")
-        }
         ApplicationManager.getApplication().invokeLater(
             { clearHighlightInternal() },
             com.intellij.openapi.application.ModalityState.any(),
@@ -662,8 +553,10 @@ class WatchpointHitHighlighter(
      * Caller must be on the EDT. Safe to invoke when there is nothing to clear
      * or when the editor has been disposed since the highlight was installed.
      *
-     * Cleanup order per handle is line highlighter → inlay → alarm; each step
-     * is guarded because any one of them can throw if its host (editor,
+     * Iterates every handle that's been installed since the last clear (a
+     * pause that drained multiple queued hits installs one per hit), and for
+     * each one cleans up in the order line highlighter → inlay → alarm. Each
+     * step is guarded because any one of them can throw if its host (editor,
      * document, alarm executor) was already disposed by the platform.
      */
     private fun clearHighlightInternal() {
@@ -672,8 +565,8 @@ class WatchpointHitHighlighter(
         currentHighlights.clear()
         for (handle in toClear) {
             try {
-                handle.pulseAlarm.cancelAllRequests()
-                Disposer.dispose(handle.pulseAlarm)
+                handle.pulseAlarm?.cancelAllRequests()
+                handle.pulseAlarm?.let { Disposer.dispose(it) }
             } catch (e: Exception) {
                 // Alarm already disposed – fine.
             }

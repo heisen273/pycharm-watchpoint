@@ -40,10 +40,10 @@ org.gradle.java.home=/opt/homebrew/Cellar/openjdk@21/21.0.11/libexec/openjdk.jdk
 
 `build.gradle.kts`:
 
-- `org.jetbrains.kotlin.jvm` **2.1.0** + `org.jetbrains.intellij.platform` **2.2.1**.
+- `org.jetbrains.kotlin.jvm` **2.2.0** + `org.jetbrains.intellij.platform` **2.16.0**.
 - Target: `pycharmCommunity("2025.1")` + `bundledPlugin("PythonCore")`.
 - Source / target: **Java 21**, Kotlin toolchain with JBR vendor.
-- `sinceBuild = "222"`, `untilBuild = "251.*"` – the user has been bumping
+- `sinceBuild = "243"`, `untilBuild = "261.*"` – the user has been bumping
   the upper bound when testing against newer IDE builds; keep this in sync
   with whatever PyCharm version they're targeting.
 
@@ -82,15 +82,19 @@ src/main/kotlin/com/pythonwatchpoint/
 │   ├── DebugWithWatchpointAction.kt   # Toolbar: clone run config + inject
 │   └── AddWatchpointAction.kt         # Variables-panel right-click
 └── icons/
-    └── WatchpointIcons.kt             # Single Icon field consumed by plugin.xml + Kotlin
+    └── WatchpointIcons.kt             # Two Icon fields (Watch + DebugWatch) consumed by plugin.xml + Kotlin
 
 src/main/resources/
 ├── META-INF/plugin.xml                # Plugin manifest
 ├── icons/                             # Plugin-owned SVGs (loaded via IconLoader)
-│   ├── watchpoint.svg                 # 16x16 light
-│   ├── watchpoint_dark.svg            # 16x16 dark (needs explicit fill or it's invisible)
+│   ├── watchpoint.svg                 # 16x16 light (Variables-panel action icon)
+│   ├── watchpoint_dark.svg            # 16x16 dark
 │   ├── watchpoint@20x20.svg           # New-UI 20x20 light
-│   └── watchpoint@20x20_dark.svg      # New-UI 20x20 dark
+│   ├── watchpoint@20x20_dark.svg      # New-UI 20x20 dark
+│   ├── debugwatchpoint.svg            # 16x16 light (toolbar "Debug with Watchpoint" icon)
+│   ├── debugwatchpoint_dark.svg       # 16x16 dark
+│   ├── debugwatchpoint@20x20.svg      # New-UI 20x20 light
+│   └── debugwatchpoint@20x20_dark.svg # New-UI 20x20 dark
 └── python/                            # Bundled watchpoint runtime
     ├── watchpoint.py
     ├── test_watchpoint.py
@@ -113,17 +117,17 @@ src/main/resources/
 </projectListeners>
 ```
 
-The `icon="..."` attribute on each `<action>` references the plugin's own icon
-via the Kotlin object's `@JvmField`:
+The `icon="..."` attribute on each `<action>` references the plugin's own icons
+via the Kotlin object's `@JvmField` fields:
 
 ```xml
-<action ... icon="com.pythonwatchpoint.icons.WatchpointIcons.Watch"/>
+<action ... icon="com.pythonwatchpoint.icons.WatchpointIcons.DebugWatch"/>  <!-- toolbar -->
+<action ... icon="com.pythonwatchpoint.icons.WatchpointIcons.Watch"/>       <!-- variables panel -->
 ```
 
-This works **only** because `WatchpointIcons.Watch` is declared `@JvmField val
-Watch: Icon = ...`. Without the annotation, Kotlin generates a getter and the
-attribute can't resolve to a static field. Same gotcha if you ever add a
-second icon.
+This works **only** because `WatchpointIcons.Watch` and `WatchpointIcons.DebugWatch`
+are declared `@JvmField val`. Without the annotation, Kotlin generates a getter
+and the attribute can't resolve to a static field.
 
 Action groups in use:
 
@@ -149,15 +153,16 @@ Action groups in use:
      - Writes a `sitecustomize.py` to a fresh temp dir
        (`/tmp/pycharm_watchpoint_XXX/`).
      - The sitecustomize, gated by `PYCHARM_WATCHPOINT_ACTIVE=1`, registers
-       a `watchpoint` module in `sys.modules` and `exec`'s the base64-decoded
-       runtime into it.
-     - Sets `PYTHONPATH = <tempdir>:<existing>` and `PYCHARM_WATCHPOINT_ACTIVE=1`
-       on the cloned config.
+       a `_pycharm_watchpoint` module in `sys.modules` and `exec`'s the
+       base64-decoded runtime into it. The underscore-prefixed name avoids
+       colliding with user projects that have their own `watchpoint` package.
+     - Sets `PYTHONPATH = <tempdir>:<existing>`, `PYCHARM_WATCHPOINT_ACTIVE=1`,
+       and `PYCHARM_WATCHPOINT_USER_ROOTS=<project.basePath>` on the cloned config.
    - Launches via `ProgramRunnerUtil.executeConfiguration(...)`.
 
 2. `WatchpointDebugListener.processStarted`:
    - Consumes the queued source from the session manager.
-   - Registers a Python exception breakpoint for `watchpoint.WatchpointHit`
+   - Registers a Python exception breakpoint for `_pycharm_watchpoint.WatchpointHit`
      (safety net – the runtime's pause-via-pydevd path doesn't raise, but
      the no-pydevd fallback does).
    - On a 500ms delay, probes via `evaluator.evaluate("hasattr(builtins, ...)`
@@ -273,14 +278,24 @@ keeps showing the **previous** type/repr until the next step or breakpoint
 hit naturally re-fetches. PyCharm snapshots variables at fetch time; it
 doesn't poll for changes the debugger didn't announce.
 
-Force the re-fetch yourself in the `evaluated` callback:
+Force the re-fetch by sending a `FRAME_CHANGED` event to **only** the
+Variables view – do NOT use `session.rebuildViews()`:
 
 ```kotlin
-XDebuggerManager.getInstance(project).currentSession?.rebuildViews()
+val session = XDebuggerManager.getInstance(project).currentSession as? XDebugSessionImpl ?: return
+val variablesView = session.sessionTab?.variablesView ?: return
+variablesView.processSessionEvent(XDebugView.SessionEvent.FRAME_CHANGED, session)
 ```
 
+**Why not `rebuildViews()`:** it dispatches `FRAME_CHANGED` to ALL debug
+views including the Frames panel, which resets the selected stack frame to
+the topmost one. If the user scrolled deep into the call stack to select a
+specific frame before right-clicking a variable, `rebuildViews()` loses
+that selection – frustrating UX. The targeted approach refreshes variable
+repr/types without touching the Frames panel at all.
+
 Call it inside `ApplicationManager.getApplication().invokeLater { ... }`
-so the rebuild lands on the EDT after the callback. Both `addWatchpoint`
+so the refresh lands on the EDT after the callback. Both `addWatchpoint`
 and `removeWatchpoint` in `AddWatchpointAction` do this – without it, the
 user sees `_WatchedAny_Order` (or `_WatchedList` for wrapped containers)
 linger in the panel until they step.
@@ -342,16 +357,24 @@ The injected `sitecustomize.py` is the heredoc inside
 
 ```python
 if os.environ.get('PYCHARM_WATCHPOINT_ACTIVE') == '1':
-    _wp_mod = types.ModuleType('watchpoint')   # register before exec
-    sys.modules['watchpoint'] = _wp_mod         # so WatchpointHit.__module__ == 'watchpoint'
+    _wp_mod = types.ModuleType('_pycharm_watchpoint')   # register before exec
+    sys.modules['_pycharm_watchpoint'] = _wp_mod         # so WatchpointHit.__module__ == '_pycharm_watchpoint'
     exec(base64.b64decode('<...>').decode(), _wp_mod.__dict__)
 ```
 
 The `__module__` matters because the IDE-side exception breakpoint is
-registered with the fully-qualified name `"watchpoint.WatchpointHit"`. If
-you exec into `globals()` of `sitecustomize` (no synthetic module), the
+registered with the fully-qualified name `"_pycharm_watchpoint.WatchpointHit"`.
+If you exec into `globals()` of `sitecustomize` (no synthetic module), the
 class's `__module__` becomes `"sitecustomize"` and the breakpoint never
 matches.
+
+The module is deliberately named `_pycharm_watchpoint` (not `watchpoint`) to
+avoid colliding with user projects that have their own top-level `watchpoint`
+package. If you ever rename it, update:
+1. The sitecustomize bootstrap in `DebugWithWatchpointAction.injectViaSiteCustomize`
+2. The fallback injection in `WatchpointDebugListener.injectAsFallback`
+3. The exception breakpoint name in `WatchpointDebugListener.addWatchpointHitBreakpoint`
+4. The framework denylist entry in `watchpoint.py` (`_FRAMEWORK_MODULE_ROOTS`)
 
 The temp dir convention is `pycharm_watchpoint_XXX/` – `cleanAllConfigurations`
 identifies stale leftovers by that prefix.
@@ -366,21 +389,68 @@ Per-session listener registered from `WatchpointDebugListener.processStarted`.
 On every `sessionPaused`:
 
 1. Query `_pycharm_consume_last_hit()` (Python builtin, see Python `CLAUDE.md`)
-   – returns base64-encoded UTF-8 of NUL-separated `file\0line\0name\0old\0new`
+   – returns base64-encoded UTF-8 of NUL-separated
+   `file\0line\0name\0old\0new\0caller_file\0caller_line` (7 fields)
    or `""` if the pause wasn't a watchpoint hit. The runtime sets and clears
    this field with consume-once semantics, so a plain breakpoint pause sees `""`.
-2. Decode, open the change-site file without stealing focus, install:
-   - **Line highlighter** with a base pale-yellow background and a coloured
-     gutter scrollbar mark (`setErrorStripeMarkColor` + `setErrorStripeTooltip`).
-   - **Inline hint** at end of line: `← watchpoint 'name' fired: old → new`,
-     rendered via a tiny custom `EditorCustomElementRenderer` (we own the
-     renderer because the platform's `HintRenderer` has moved packages
-     between releases).
-   - **Pulse animation**: 3s decaying-amplitude amber pulse on the line
-     background. Sinusoidal intensity * linear envelope. Implemented via an
-     `Alarm(project)` that re-schedules itself every 60ms and lands back on
-     the static base colour when elapsed >= `pulseTotalMs`.
-3. On `sessionResumed` / `sessionStopped`, clear everything.
+2. **Two-phase highlight** (immediate decoration + delayed jump):
+   - **Phase 1 (immediate, via `invokeLater`)**: get the editor for the
+     mutation file (silently via `getEditors` if already open, or `openFile`
+     if not) and install all decorations:
+     - **Primary line highlighter** with a base pale-yellow background and a
+       coloured gutter scrollbar mark (`setErrorStripeMarkColor` +
+       `setErrorStripeTooltip`).
+     - **Inline hint** at end of line: `← watchpoint 'name' fired: old → new`,
+       rendered via a tiny custom `EditorCustomElementRenderer` (we own the
+       renderer because the platform's `HintRenderer` has moved packages
+       between releases).
+     - **Pulse animation**: 1.5s decaying-amplitude amber pulse on the line
+       background. Exponential decay (`exp(-4t)`). Implemented via an
+       `Alarm(project)` that re-schedules itself every 60ms and lands back on
+       the static base colour when elapsed >= `pulseTotalMs`.
+     - **Secondary "call-site" highlight**: if `caller_file` / `caller_line`
+       from the payload differ from the mutation site, a subtler static
+       (no pulse) pale-amber highlight + inline hint
+       (`"← watchpoint 'X' changed inside this call"`) is applied at the
+       call-site line. This breadcrumb tells the user which call led to
+       the mutation when the pause file differs from the mutation file.
+       Skipped when caller == mutation line (would overlap with primary).
+   - **Phase 2 (after 150ms `Alarm`)**: re-select the mutation file's tab
+     and scroll to the hit line. The delay lets the IDE's post-pause focus
+     settle first so our tab selection wins and sticks.
+3. On `sessionResumed` / `sessionStopped`, clear everything (both primary
+   and secondary highlights share `currentHighlights` and are cleaned
+   together).
+
+**Why the two-phase split** – not obvious but load-bearing:
+
+The bp-based pause mechanism (see Python `CLAUDE.md` §13) anchors the
+pause on `_install_pause_breakpoint`'s next-code-line, which is usually
+NOT the mutation file. Example: `set_accessible_products` mutates on
+`user_hotel_relationship.py:195`, but the bp fires at
+`features_calculation.py:594` (the caller's next line). The IDE's
+post-pause UI focuses the editor on the pause file
+(`features_calculation.py`). If we jump to the mutation file IMMEDIATELY
+on sessionPaused, two focus events race – the IDE wins (it runs later)
+and our mutation file flashes on screen for ~20ms before snapping back
+to the pause file. Phase 2's 150ms delay lets the IDE settle first;
+then our tab selection runs and sticks. Meanwhile Phase 1 ensures the
+highlight decoration is already painted on the editor – so when the tab
+becomes visible after Phase 2, the user sees it immediately with no
+perceptible delay.
+
+`focusEditor=false` is deliberate: it selects the tab (makes the file
+visible) but does NOT give the editor keyboard focus. This means no
+blinking caret appears on the highlighted line – replicating the
+regular debugger experience where the execution line is decorated but
+focus stays on the Debug tool window. Using `true` here caused a
+visible caret at column 0 of the pause line, which felt foreign.
+
+If 150ms still causes the flash, the IDE's settle window may have grown
+– increase the delay. The Alarm is project-parented so it gets disposed
+if the project closes mid-delay, and the `disposed` check inside the
+callback catches sessions that ended (sessionStopped / processStopped)
+during the delay.
 
 **Critical evaluator gotcha** – not in the generic IntelliJ docs:
 
@@ -410,6 +480,29 @@ load-bearing because shutdown can put up a modal dialog that would otherwise
 swallow the cleanup. `dispose()` is called from
 `WatchpointDebugListener.processStopped` **before** the session listener is
 removed.
+
+**Secondary "call-site" highlight** – the mechanism for finding the right line:
+
+The hit payload now includes `caller_file` / `caller_line` (fields 6–7),
+populated by the Python runtime's frame-walk-to-bp-file logic. After
+`_compute_bp_targets` returns (so we know the bp file = `targets[0][0]`),
+the runtime walks up from `user_frame.f_back` looking for a frame whose
+`co_filename` matches the bp file. If found, that frame's `f_lineno` is
+the call-site line (e.g. `self._authorization(request)` in `dispatch`).
+Falls back to `user_frame.f_back` (direct parent) when no ancestor matches.
+
+On the Kotlin side, `HitInfo` carries `callerFile` / `callerLine`. The
+`applySecondaryHighlight` method installs a static (no-pulse) pale-amber
+highlight at that location. `HighlightHandle.pulseAlarm` is nullable
+(`Alarm?`) – secondary handles pass `null` since they don't animate.
+
+Edge cases handled:
+- Same line as primary → secondary skipped (would overlap).
+- `callerFile` empty or `callerLine == 0` → secondary skipped (no data).
+- Deep call chains (dispatch → _authorization → contextlib → mutator):
+  the walk finds `dispatch` because it's in the same file as the bp target.
+- Cross-file mutations (middleware A → middleware B): walk finds no match,
+  falls back to f_back (middleware A's call line).
 
 ## Variables-panel highlighting (`WatchpointTreeCellRenderer` + `WatchpointMarkerService`)
 
@@ -453,8 +546,13 @@ sync the service. The hook is easy to add but no one has asked for it.
 
 ## Custom icons (`WatchpointIcons` + SVG variants)
 
-Loaded once via `IconLoader.getIcon("/icons/watchpoint.svg", WatchpointIcons::class.java)`.
-The platform finds the size/theme variants by filename convention:
+Two icons loaded via `IconLoader.getIcon(...)`:
+- `Watch` – spectacles glyph, used in the Variables-panel right-click action
+  and the tree cell renderer.
+- `DebugWatch` – bug + spectacles badge, used on the "Debug with Watchpoint"
+  toolbar action.
+
+The platform finds size/theme variants by filename convention:
 
 | File                          | Resolved when                       |
 |-------------------------------|-------------------------------------|
@@ -462,6 +560,10 @@ The platform finds the size/theme variants by filename convention:
 | `watchpoint_dark.svg`         | Classic UI, dark theme              |
 | `watchpoint@20x20.svg`        | New UI, light theme                 |
 | `watchpoint@20x20_dark.svg`   | New UI, dark theme                  |
+| `debugwatchpoint.svg`         | Classic UI, light theme             |
+| `debugwatchpoint_dark.svg`    | Classic UI, dark theme              |
+| `debugwatchpoint@20x20.svg`   | New UI, light theme                 |
+| `debugwatchpoint@20x20_dark.svg` | New UI, dark theme               |
 
 **Dark-variant fill is mandatory** – the SVG path defaults to black, which is
 invisible on a dark background. The dark variants set `fill="#AFB1B3"` (a
@@ -513,6 +615,33 @@ the plugin (or at least re-run `processResources` + relaunch the IDE
 sandbox). The runtime is base64-encoded into the resource jar at build time;
 hot-reload doesn't reach it.
 
+If `./gradlew runIde` doesn't seem to pick up your changes, run
+`./gradlew clean` first – gradle's caching can serve a stale resource
+bundle if file mtimes don't tick. The `_RUNTIME_VERSION` string in
+`watchpoint.py` is the source of truth for "is my latest code loaded";
+check `/tmp/pythonwatchpoint.log` for the `runtime loaded: version=...`
+line on first watcher fire.
+
+### When the highlighter switches focus to the wrong file (the "flash" bug)
+
+The bp-based pause mechanism (Python `CLAUDE.md` §13) anchors the
+pause on `_install_pause_breakpoint`'s next-code-line, which is usually
+NOT the mutation file. The IDE focuses on the pause-anchor file post-
+pause. Our `WatchpointHitHighlighter` then opens the mutation file
+with `focusEditor=false` (selects the tab without keyboard focus). If
+we jump BEFORE the IDE settles, the IDE wins (it runs later) and our
+mutation file tab flashes before snapping back – the user-reported
+"it switches to that file and then switches back" symptom.
+
+Fix: two-phase approach. Phase 1 applies the highlight decoration
+immediately (via `invokeLater` – no artificial delay) so the user sees
+instant feedback. Phase 2 re-selects the tab and scrolls to the line
+after a 150ms `Alarm` delay – by then the IDE has settled on its own
+focus, so our tab selection runs last and sticks. The `disposed` check
+inside the callback handles sessions that ended during the delay. If
+feedback says it's still flashy, the IDE's settle window has grown –
+increase the Phase 2 delay.
+
 ### When the user reports a debugger-side bug
 
 First questions to answer (Python `CLAUDE.md` has these in detail):
@@ -543,11 +672,25 @@ First questions to answer (Python `CLAUDE.md` has these in detail):
   - `STATE_RUN` and `PYTHON_SUSPEND` (in `_pydevd_bundle.pydevd_constants`)
   - `set_trace_for_frame_and_parents`, `trace_dispatch` (on the PyDB instance)
   - `_pydevd_bundle.pydevd_constants.GlobalDebuggerHolder` (for debugger lookup)
+  - **PEP 669 `DEBUGGER_ID` (= 0) is claimed by pydevd at session start.**
+    The runtime's `_pause_via_pydevd` reaches into pydevd's tool slot via
+    `sys.monitoring.get_local_events(0, ...)` / `set_local_events(0, ...)`
+    to force-arm `LINE + PY_RETURN` on `user_frame.f_code` and
+    `user_frame.f_back.f_code` after `set_trace_for_frame_and_parents` runs.
+    The official API silently no-ops on the monitoring side for many
+    frames; without the supplement, helper functions whose only line is
+    the watched mutation (e.g. `def charge_card(...): order.status =
+    "paid"`) silently swallow the pause because pydevd never sees a
+    follow-up LINE in the helper. The supplement is what made
+    test_demo_b's three back-to-back mutations actually produce three
+    pauses. See Python `CLAUDE.md` §"PEP 669 supplement" for the full
+    rationale and the regression test.
 
   Our pause flow uses the same scoped-step-over mechanism as
   `pydevd.settrace(stop_at_frame=user_frame)` – setting `step_cmd =
   CMD_STEP_OVER` + `step_stop = user_frame` and letting pydevd's tracer
-  fire the actual pause when a LINE event lands on `user_frame`.
+  fire the actual pause when a LINE / PY_RETURN event lands on
+  `user_frame` (or the next LINE in its caller, once `user_frame` returns).
 
   We deliberately do NOT use the two more "obvious" alternatives, even
   though they look simpler:
@@ -578,6 +721,45 @@ First questions to answer (Python `CLAUDE.md` has these in detail):
   `_pause_via_pydevd` returns early (e.g. `info.is_tracing` was already
   set), the runtime's no-pydevd fallback raises, and the breakpoint
   catches it.
+- **The actual primary pause mechanism is `_install_pause_breakpoint`,
+  NOT `_pause_via_pydevd`.** `_pause_via_pydevd`'s `CMD_STEP_OVER + step_stop`
+  approach was unreliable in PEP 669 mode (pydevd's per-function
+  LINE-tracing decision can't be retroactively changed). The runtime
+  now installs real pydevd `LineBreakpoint`s via
+  `py_db.consolidate_breakpoints` and forces LINE events armed on the
+  target code object via `sys.monitoring.set_local_events`. Bps are
+  tracked in `WatchpointRegistry._temp_breakpoints` and removed on
+  every sessionPaused via `_pycharm_consume_last_hit`. See Python
+  `CLAUDE.md` §13 for the full mechanism. From the plugin side, this
+  is invisible – the Kotlin code just reads `_pycharm_consume_last_hit`
+  as before. But if you see weird "bps appearing in PyCharm's
+  Breakpoints panel" or "phantom pauses after watchpoint hits," that's
+  the cleanup pipeline misfiring.
+
+## Diagnostic affordances – runtime fingerprint + file log
+
+When a user reports a watchpoint bug, two things have always been
+load-bearing for diagnosis:
+
+**Runtime version fingerprint.** `watchpoint.py` defines
+`_RUNTIME_VERSION` (a string like `"2026-05-31-reject-backward-bp-line-v21"`)
+and emits it via `_log_warn` at module load. When the user says "I
+rebuilt the plugin and it STILL doesn't work," the first thing to
+check is whether their `/tmp/pythonwatchpoint.log` contains the
+expected version stamp – distinguishes "fix didn't help" from
+"you're testing a stale build" (`./gradlew clean && ./gradlew runIde`
+forces a fresh resource bundle). Bump the version string on every
+meaningful behavioral change.
+
+**File-based diagnostic log.** `_log_warn` writes to BOTH `sys.stderr`
+AND `/tmp/pythonwatchpoint.log` (timestamped, append-mode, truncated
+to 1 MB when it grows past 2 MB). Under pytest's default capture
+mode, stderr is hidden, so `[WATCHPOINT] ...` lines never reach the
+user's terminal or Debug Console. Pydevd's stdout/stderr interception
+can also rewrite or drop lines. The file sink is the durable log a
+user can `tail -f` during a session. The path is fixed (not env-driven)
+on purpose – one less moving part for users to set up when reporting
+a bug.
 
 ## Logger notes
 
@@ -599,6 +781,12 @@ shows a red notification balloon to the user.
 - No tests on the Kotlin side yet. Adding `Test` framework wiring with
   `intellijPlatform.testFramework(TestFrameworkType.Platform)` is already
   in `build.gradle.kts`; tests would go under `src/test/kotlin/`.
+- `WatchpointHitHighlighter` skips (rather than clamping) when the hit
+  line exceeds the file's current line count – this avoids decorating an
+  unrelated line when the user edits files during a debug session.
+- `WatchpointSessionManager.consumeWatchpointCode()` uses
+  `AtomicReference.getAndSet(null)` for true atomicity across concurrent
+  session launches.
 
 ## Where to go for runtime details
 
@@ -609,17 +797,25 @@ re-read before touching the runtime:
   propagation (CALL → queue → PY_START → arm-on-callee-param); #9 covers
   container-mutation watchers (`_WatchedList`/`Dict`/`Set` wrap-and-replace)
   + recursive object-wide instrumentation (`_instrument_object_tree`
-  walking nested attrs to depth 4); #10 covers the classpatch fallback
-  for hostile metaclasses (Django Model / SQLAlchemy declarative-base)
-  where dynamic subclassing fails and we monkey-patch `cls.__setattr__`
-  scoped to the watched instance via a per-class `instance_watches`
-  table keyed by `id(obj)`.
+  walking nested attrs to depth 4, breadth-capped at 100 sub-watches,
+  with framework-type / class-object / runtime-caller filters layered
+  on top); #10 covers the classpatch fallback for hostile metaclasses
+  (Django Model / SQLAlchemy declarative-base) where dynamic
+  subclassing fails and we monkey-patch `cls.__setattr__` scoped to
+  the watched instance via a per-class `instance_watches` table keyed
+  by `id(obj)`.
 - "The pydevd pause – tread carefully" – the urllib trap.
 - "Things you might be tempted to do, but shouldn't" – the anti-pattern
   list. Several entries directly correspond to bugs we lived through in
-  earlier sessions.
+  earlier sessions. Notably: the framework-type filter
+  (`_is_user_defined_type`), the persistent `root_watch.visited_ids`
+  set, the `_MAX_SUB_WATCHES_PER_ROOT` cap, and the `_find_user_caller`
+  runtime-frame walk are each backed by a "don't remove this" entry –
+  they together fix the Django QuerySet meltdown where the IDE froze
+  on every Variables-panel expansion.
 - "Known limitations" – behaviors that are intentionally off (`del attr`,
   `__dict__` bypass, interned-primitive over-watch, container aliases
   captured before watch-arm, recursion depth cap, slotted-class skip,
-  etc.) and have regression tests; don't "fix" them without re-reading
-  the rationale.
+  framework-type recursion stop, class-object recursion stop,
+  runtime-caller hit drop, breadth cap, etc.) and have regression
+  tests; don't "fix" them without re-reading the rationale.

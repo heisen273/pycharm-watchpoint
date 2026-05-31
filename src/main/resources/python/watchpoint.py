@@ -24,43 +24,15 @@ Cross-version notes (3.12 / 3.13 / 3.14):
   try/except inside the monitored frame – they surface in the CALLER. Tests
   expecting WatchpointHit must therefore wrap the monitored code in a helper.
 """
-import os
 import sys
 import builtins
 import threading
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 if sys.version_info < (3, 12):
     raise RuntimeError("watchpoint.py requires Python 3.12+.")
 
 _monitoring = sys.monitoring
-
-
-# ---------------------------------------------------------------------------
-# Debug logging – gated, so it never spams pydevd users
-# ---------------------------------------------------------------------------
-
-# Active when the user sets PYCHARM_WATCHPOINT_DEBUG=1 OR debugpy is in sys.modules
-# (debugpy support is in beta; users on that path get verbose tracing for free so
-# we can diagnose failures from their stderr without asking them to re-run with a flag).
-def _dbg_enabled() -> bool:
-    """True when we should emit `[WATCHPOINT/dbg]` traces to stderr.
-
-    Cheap to call from hot paths because each branch short-circuits. Re-evaluated
-    every call rather than cached so toggling the env var between runs Just Works.
-    """
-    if os.environ.get("PYCHARM_WATCHPOINT_DEBUG") == "1":
-        return True
-    return "debugpy" in sys.modules
-
-
-def _dbg_log(msg: str) -> None:
-    """Emit a single-line debug trace. Silent unless _dbg_enabled()."""
-    if _dbg_enabled():
-        try:
-            print(f"[WATCHPOINT/dbg] {msg}", file=sys.stderr, flush=True)
-        except Exception:  # noqa: BLE001
-            pass  # stderr could be closed during interpreter shutdown – never raise from a trace.
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +66,15 @@ class WatchpointHit(Exception):
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
+
+# Flag: when set to a thread ident, _handle_hit silently drops mutations
+# on THAT thread only. Set around the installation flow (watch_at →
+# add_watch → _instrument_object_tree) to suppress side-effect hits caused
+# by our own tree walk triggering lazy evaluation (e.g.
+# SimpleLazyObject.__getattr__ → __setattr__). Thread-scoped so that real
+# mutations on OTHER user threads are not accidentally suppressed while the
+# IDE evaluator thread is mid-installation.
+_installing_watch_thread: Optional[int] = None
 
 class WatchpointRegistry:
     """Tracks active local-variable and attribute watchpoints.
@@ -154,6 +135,52 @@ class WatchpointRegistry:
         # no pending hit – also reset by `clear_watches` so a fresh session
         # doesn't inherit a stale entry.
         self._last_hit: Optional[dict] = None
+
+        # Hit QUEUE – every hit since `_pycharm_consume_last_hit` last drained
+        # entries matching the IDE's current pause location. Each hit carries
+        # its own `bp_anchor_file` / `bp_line` tagging the pydevd
+        # `LineBreakpoint` we installed for it; the drain filters by those
+        # fields so only the hit whose bp triggered THIS pause gets returned.
+        # Hits whose bps haven't fired yet stay queued for a future pause.
+        #
+        # Sequential pre-emptive bps (design contract §11, post-v8): when N
+        # back-to-back mutations all walk up to the SAME user-code anchor
+        # frame, each one is given its OWN bp at the NEXT available code
+        # line after the previous hit's bp. Hit 1 → anchor's next line; hit
+        # 2 → line after hit 1's bp_line; hit 3 → line after hit 2; etc.
+        # This is what makes "4 attribute writes inside one library call"
+        # surface as four separate pauses instead of one – previously a
+        # process-level `_pause_pending` gate dropped hits 2-N silently.
+        self._hit_queue: list = []
+
+        # Track temp breakpoints installed by `_install_bp_at` so we can
+        # remove them in `_pycharm_consume_last_hit` (when the matching
+        # pause has been consumed) and in `clear_watches` (test isolation).
+        # List of `(file, line, bp_id)` tuples. Each entry is one
+        # `LineBreakpoint` we installed via `py_db.consolidate_breakpoints`.
+        # Drain is selective: only bps at the IDE's current pause location
+        # are removed, leaving sibling bps armed for their future pauses.
+        # Cleaned up best-effort: a leaked entry just means a phantom bp
+        # the user has to remove manually, not a correctness issue.
+        self._temp_breakpoints: list = []
+
+        # Direct-pause mechanism: maps (id(code_object), line) → True for
+        # bp targets we want to pause at. When our own _on_line callback
+        # (fired on _TOOL_ID, independent of pydevd's DEBUGGER_ID) sees a
+        # matching (code, line), it calls do_wait_suspend directly on the
+        # frame – completely bypassing pydevd's py_line_callback which may
+        # fail to fire for library code mid-execution (the csp mystery).
+        # Entries are added by `_install_bp_at` and removed by
+        # `_pycharm_consume_last_hit` or when our _on_line fires.
+        self._bp_pause_pending: dict = {}
+
+        # Breakpoint slot reservations: {(id(code_object), line)} selected by
+        # `_compute_bp_targets` but not yet reflected in `_hit_queue` as an
+        # installed bp. This closes a narrow race where two threads computed
+        # targets while the queue was still empty and both installed at the
+        # same line. Reservations are released as soon as install succeeds
+        # (the queued `bp_locations` becomes the durable owner) or fails.
+        self._bp_slot_reservations: set = set()
 
     # ------------------------------------------------------------------
     # Public API
@@ -224,6 +251,20 @@ class WatchpointRegistry:
             # Drop any pending hit so a follow-up `consume_last_hit` doesn't
             # surface a hit that belongs to a now-removed watch.
             self._last_hit = None
+            self._hit_queue.clear()
+            # Snapshot + clear the temp breakpoint list under the lock;
+            # actual pydevd remove happens after we release `_lock` so we
+            # don't hold it across pydevd's own locks.
+            bps_to_remove = list(self._temp_breakpoints)
+            self._temp_breakpoints.clear()
+            self._bp_pause_pending.clear()
+            self._bp_slot_reservations.clear()
+        # Best-effort remove of any temp pydevd breakpoints we'd installed.
+        # If pydevd isn't loaded (the test path) this is a no-op.
+        if bps_to_remove:
+            py_db = _get_pydevd_debugger()
+            if py_db is not None:
+                _remove_temp_breakpoints(py_db, bps_to_remove)
         # Drop the current thread's propagation queue too – between test
         # cases (conftest calls clear_watches) any leftover CALL entries
         # would otherwise survive and arm spurious watches in later tests.
@@ -361,7 +402,7 @@ class WatchpointRegistry:
                     # fire too. Without this, `obj.attr = []; obj.attr.append(x)`
                     # would lose the watch on the first reassignment. The wrap
                     # is idempotent for already-wrapped values.
-                    if isinstance(value, _CONTAINER_TYPES) and not isinstance(value, _WATCHED_CONTAINER_TYPES):
+                    if type(value) in _CONTAINER_TYPES and not isinstance(value, _WATCHED_CONTAINER_TYPES):
                         value = _wrap_container(value, _registry_self, _expr)
                         # Keep the registry's _AttributeWatch in sync so unwatch
                         # restores the *current* (newly wrapped) attribute and
@@ -373,15 +414,16 @@ class WatchpointRegistry:
                         super().__setattr__(name, value)
                         _registry_self._guard.active = True
                         try:
-                            caller = sys._getframe(1)
-                            _registry_self._handle_hit(
-                                user_frame=caller,
-                                watch_name=_expr,
-                                old_repr=_safe_repr(old_val),
-                                new_repr=_safe_repr(value),
-                                source_file=caller.f_code.co_filename,
-                                source_line=caller.f_lineno,
-                            )
+                            user_caller = _find_user_caller(sys._getframe(1))
+                            if user_caller is not None:
+                                _registry_self._handle_hit(
+                                    user_frame=user_caller,
+                                    watch_name=_expr,
+                                    old_repr=_safe_repr(old_val),
+                                    new_repr=_safe_repr(value),
+                                    source_file=user_caller.f_code.co_filename,
+                                    source_line=user_caller.f_lineno,
+                                )
                         finally:
                             _registry_self._guard.active = False
                     else:
@@ -429,7 +471,7 @@ class WatchpointRegistry:
         # treat itself as an orphaned wrapper. The replacement goes through
         # the rebind-detector with the guard up so it doesn't fire on our
         # own assignment.
-        if isinstance(initial_val, _CONTAINER_TYPES) and not isinstance(initial_val, _WATCHED_CONTAINER_TYPES):
+        if type(initial_val) in _CONTAINER_TYPES and not isinstance(initial_val, _WATCHED_CONTAINER_TYPES):
             wrapped = _wrap_container(initial_val, self, expr)
             self._guard.active = True
             try:
@@ -473,7 +515,7 @@ class WatchpointRegistry:
         # Container wrap at the leaf. The wrap setattr goes through our
         # newly-installed patched __setattr__; the guard is up so it doesn't
         # fire as a spurious initial hit.
-        if (isinstance(initial_val, _CONTAINER_TYPES)
+        if (type(initial_val) in _CONTAINER_TYPES
                 and not isinstance(initial_val, _WATCHED_CONTAINER_TYPES)):
             wrapped = _wrap_container(initial_val, self, expr)
             self._guard.active = True
@@ -512,13 +554,14 @@ class WatchpointRegistry:
         """
         root_watch = self._install_single_object_watch(expr, obj, root_expr=expr)
         self._attr_watches[expr] = root_watch
-        # Snapshot of ids we've already instrumented. Shared across the
-        # recursion so a graph like `a.left = a.right` (same object reached
-        # via two paths) gets instrumented exactly once.
-        visited = {id(obj)}
+        # Seed the persistent visited set with the root object's id so the
+        # initial walk + every later __setattr__-triggered re-entry share a
+        # single cycle-detection set. See `_AttributeWatch.visited_ids` for
+        # why this lives on the watch (not as a per-call argument).
+        root_watch.visited_ids.add(id(obj))
         self._instrument_object_tree(
             obj, root_expr=expr, current_path=expr,
-            depth=1, visited=visited, root_watch=root_watch,
+            depth=1, root_watch=root_watch,
         )
 
     def _install_single_object_watch(self, expr: str, obj: Any,
@@ -562,18 +605,31 @@ class WatchpointRegistry:
                 f"Cannot watch '{expr}': type {original_cls.__name__} has a "
                 f"metaclass that refuses dynamic subclassing. ({e})"
             ) from e
+        # The `__class__` swap itself is a setattr on `obj`. If `obj` is
+        # already wrapped by a previously-installed watcher (this method
+        # is called recursively from `_instrument_object_tree` for nested
+        # attrs, so the holder's watcher may be active), the assignment
+        # would fire that watcher's `__setattr__` and queue a spurious hit.
+        # Set the per-thread guard around the swap so the parent watcher
+        # treats this as a silent rewrite.
+        prev_guard = getattr(self._guard, "active", False)
+        self._guard.active = True
         try:
-            obj.__class__ = watcher_cls
-        except (TypeError, AttributeError) as e:
-            # Frozen dataclasses raise `FrozenInstanceError` (an
-            # AttributeError subclass) from their custom __setattr__; some
-            # exotic classes raise plain TypeError if their layout forbids
-            # the swap. Convert either into a TypeError that `add_watch`
-            # catches and falls back to local-variable detection.
-            raise TypeError(
-                f"Cannot watch object '{expr}': __class__ surgery failed on "
-                f"{original_cls.__name__} ({e})."
-            ) from e
+            try:
+                obj.__class__ = watcher_cls
+            except (TypeError, AttributeError) as e:
+                # Frozen dataclasses raise `FrozenInstanceError` (an
+                # AttributeError subclass) from their custom __setattr__;
+                # some exotic classes raise plain TypeError if their layout
+                # forbids the swap. Convert either into a TypeError that
+                # `add_watch` catches and falls back to local-variable
+                # detection.
+                raise TypeError(
+                    f"Cannot watch object '{expr}': __class__ surgery failed on "
+                    f"{original_cls.__name__} ({e})."
+                ) from e
+        finally:
+            self._guard.active = prev_guard
 
         return _AttributeWatch(
             expr=expr,
@@ -670,7 +726,7 @@ class WatchpointRegistry:
                 # If the incoming value is a mutable container, wrap it
                 # so subsequent `.append` / `[k]=v` / etc. on the new
                 # attribute fire under the same root watch.
-                if isinstance(value, _CONTAINER_TYPES) and not isinstance(value, _WATCHED_CONTAINER_TYPES):
+                if type(value) in _CONTAINER_TYPES and not isinstance(value, _WATCHED_CONTAINER_TYPES):
                     wrapped_value = _wrap_container(value, _registry_self, sub_expr)
                 else:
                     wrapped_value = value
@@ -687,7 +743,7 @@ class WatchpointRegistry:
                         # if it's a user-defined object. Both happen under
                         # the guard so any setattrs we trigger are silent.
                         root_watch = _registry_self._attr_watches.get(_root_expr)
-                        if root_watch is not None:
+                        if root_watch is not None and not root_watch.sub_watches_capped:
                             if wrapped_value is not value:
                                 # We wrapped a container into wrapped_value.
                                 sub_w = _AttributeWatch(
@@ -700,33 +756,50 @@ class WatchpointRegistry:
                                 sub_w.container_wrapper = wrapped_value
                                 sub_w.container_holder = self
                                 sub_w.container_attr = name
-                                root_watch.sub_watches.append(sub_w)
-                            elif _is_object_watchable(wrapped_value):
+                                _try_add_sub_watch(root_watch, sub_w)
+                            elif (_is_object_watchable(wrapped_value)
+                                    and not isinstance(wrapped_value, type)
+                                    and _is_user_defined_type(type(wrapped_value))
+                                    and id(wrapped_value) not in root_watch.visited_ids):
+                                # Same framework / class-object / cycle gates as
+                                # `_instrument_object_tree` – this `__setattr__`
+                                # path is the secondary entry point and used to
+                                # reset depth + visited on every call, which is
+                                # exactly how the Django-shaped explosion
+                                # snowballed. Reuse `root_watch.visited_ids` so
+                                # cycle detection survives across re-entries.
+                                root_watch.visited_ids.add(id(wrapped_value))
                                 try:
                                     sub_w = _registry_self._install_single_object_watch(
                                         sub_expr, wrapped_value, root_expr=_root_expr,
                                     )
-                                    root_watch.sub_watches.append(sub_w)
-                                    _registry_self._instrument_object_tree(
-                                        wrapped_value, root_expr=_root_expr,
-                                        current_path=sub_expr, depth=1,
-                                        visited={id(wrapped_value)},
-                                        root_watch=root_watch,
-                                    )
+                                    if _try_add_sub_watch(root_watch, sub_w):
+                                        _registry_self._instrument_object_tree(
+                                            wrapped_value, root_expr=_root_expr,
+                                            current_path=sub_expr, depth=1,
+                                            root_watch=root_watch,
+                                        )
                                 except TypeError:
                                     # Frozen / slotted / etc. – skip
                                     # auto-instrumentation but the rebind
                                     # already fired so the user knows.
                                     pass
-                        caller = sys._getframe(1)
-                        _registry_self._handle_hit(
-                            user_frame=caller,
-                            watch_name=sub_expr,
-                            old_repr=_safe_repr(old_val),
-                            new_repr=_safe_repr(wrapped_value),
-                            source_file=caller.f_code.co_filename,
-                            source_line=caller.f_lineno,
-                        )
+                        # Walk past our own `<string>`-exec'd frames to find
+                        # the user's mutation site. If the entire f_back
+                        # chain is runtime (descriptor side-effect during
+                        # IDE display, etc.), drop the hit silently – the
+                        # mutation didn't originate from user code and
+                        # firing a hit would just flood pydevd's queue.
+                        user_caller = _find_user_caller(sys._getframe(1))
+                        if user_caller is not None:
+                            _registry_self._handle_hit(
+                                user_frame=user_caller,
+                                watch_name=sub_expr,
+                                old_repr=_safe_repr(old_val),
+                                new_repr=_safe_repr(wrapped_value),
+                                source_file=user_caller.f_code.co_filename,
+                                source_line=user_caller.f_lineno,
+                            )
                     finally:
                         _registry_self._guard.active = False
                 else:
@@ -735,23 +808,35 @@ class WatchpointRegistry:
         return _WatchedAnyAttrSubclass
 
     def _instrument_object_tree(self, obj: Any, root_expr: str, current_path: str,
-                                depth: int, visited: set,
+                                depth: int,
                                 root_watch: "_AttributeWatch") -> None:
         """Recursively instrument `obj`'s nested user-defined attributes.
 
         For every attribute on `obj.__dict__`:
         - `list` / `dict` / `set` value → wrap in `_WatchedList/Dict/Set`;
           record a container-wrap sub-watch in `root_watch.sub_watches`.
-        - User-defined-object value (per `_is_object_watchable`) → install
+        - User-defined-object value (per `_is_object_watchable` AND
+          `_is_user_defined_type`, AND not a class object) → install
           class surgery (`_install_single_object_watch`); record the
           resulting sub-watch; recurse one level deeper.
-        - Anything else (primitives, builtins, already-watched values) → skip.
+        - Framework objects (Django QuerySet, SQLAlchemy session,
+          stdlib types, etc. – anything `_is_user_defined_type` rejects),
+          class objects, primitives, already-watched values → skip.
 
-        Depth-capped at `_RECURSIVE_OBJECT_WATCH_DEPTH` and cycle-guarded by
-        `visited` (set of `id()`s) so a graph like `a.left = a; a.right = a`
-        doesn't spin forever.
+        Depth-capped at `_RECURSIVE_OBJECT_WATCH_DEPTH` and cycle-guarded
+        by `root_watch.visited_ids` (shared across this walk AND every
+        later `__setattr__`-triggered re-entry, so a graph like
+        `a.left = a.right` is instrumented exactly once for the lifetime
+        of the watch – not once per re-entry).
+
+        Bails out if `root_watch.sub_watches_capped` is set, which
+        `_try_add_sub_watch` flips on the first time the per-root sub-
+        watch count would exceed `_MAX_SUB_WATCHES_PER_ROOT`. Belt-and-
+        suspenders against any cycle the type filter + visited set miss.
         """
         if depth > _RECURSIVE_OBJECT_WATCH_DEPTH:
+            return
+        if root_watch.sub_watches_capped:
             return
         for attr_name in _safe_iter_dict_attrs(obj):
             try:
@@ -762,7 +847,7 @@ class WatchpointRegistry:
                 continue
             sub_expr = f"{current_path}.{attr_name}"
 
-            if (isinstance(attr_value, _CONTAINER_TYPES)
+            if (type(attr_value) in _CONTAINER_TYPES
                     and not isinstance(attr_value, _WATCHED_CONTAINER_TYPES)):
                 wrapped = _wrap_container(attr_value, self, sub_expr)
                 self._guard.active = True
@@ -785,24 +870,42 @@ class WatchpointRegistry:
                     sub_w.container_wrapper = wrapped
                     sub_w.container_holder = obj
                     sub_w.container_attr = attr_name
-                    root_watch.sub_watches.append(sub_w)
+                    if not _try_add_sub_watch(root_watch, sub_w):
+                        return
                 continue
 
-            if _is_object_watchable(attr_value):
-                if id(attr_value) in visited:
-                    continue
-                visited.add(id(attr_value))
-                try:
-                    sub_w = self._install_single_object_watch(
-                        sub_expr, attr_value, root_expr=root_expr,
-                    )
-                except TypeError:
-                    continue
-                root_watch.sub_watches.append(sub_w)
-                self._instrument_object_tree(
-                    attr_value, root_expr=root_expr, current_path=sub_expr,
-                    depth=depth + 1, visited=visited, root_watch=root_watch,
+            if not _is_object_watchable(attr_value):
+                continue
+            # Don't recurse into class objects (their __dict__ is
+            # descriptors, not data; walking it would resolve every
+            # property/classmethod/descriptor and chain explosively –
+            # especially under ORMs where class-level descriptors
+            # fabricate proxy instances on access).
+            if isinstance(attr_value, type):
+                continue
+            # Don't recurse into framework / stdlib / site-packages
+            # types. The user wants coverage of THEIR code; framework
+            # internals do their own setattrs as side effects of attr
+            # reads (Django descriptors, SQLAlchemy lazy loaders, etc.)
+            # which would re-trigger our watcher in an unbounded loop.
+            # See `_is_user_defined_type` for the heuristic.
+            if not _is_user_defined_type(type(attr_value)):
+                continue
+            if id(attr_value) in root_watch.visited_ids:
+                continue
+            root_watch.visited_ids.add(id(attr_value))
+            try:
+                sub_w = self._install_single_object_watch(
+                    sub_expr, attr_value, root_expr=root_expr,
                 )
+            except TypeError:
+                continue
+            if not _try_add_sub_watch(root_watch, sub_w):
+                return
+            self._instrument_object_tree(
+                attr_value, root_expr=root_expr, current_path=sub_expr,
+                depth=depth + 1, root_watch=root_watch,
+            )
 
     # ------------------------------------------------------------------
     # Removal internals
@@ -1044,8 +1147,8 @@ class WatchpointRegistry:
             # Safety cap: pathological cases (rare arg-binding failures that
             # raise before the callee body runs, or a stalled callable that
             # never reaches PY_START) would otherwise grow the queue without
-            # bound. 128 is well above any plausible legitimate nesting.
-            if len(queue) > 128:
+            # bound. See `_MAX_PROPAGATION_QUEUE_SIZE` for rationale.
+            if len(queue) > _MAX_PROPAGATION_QUEUE_SIZE:
                 del queue[0]
 
             # Enable the same set of events on the callee's code object so
@@ -1127,6 +1230,94 @@ class WatchpointRegistry:
             return
         self._guard.active = True
         try:
+            # ── Direct-pause mechanism ───────────────────────────────────
+            # Check if this (code, line) is a pending bp pause target. If
+            # so, trigger do_wait_suspend directly – bypassing pydevd's
+            # py_line_callback which may silently fail for library code
+            # whose PY_START returned DISABLE before our bp was installed
+            # (the csp/_make_nonce mystery: py_line_callback fires for
+            # pydevd's DEBUGGER_ID but our set_local_events on DEBUGGER_ID
+            # doesn't reliably re-arm mid-execution instrumentation in all
+            # CPython builds; our OWN tool's callback always fires because
+            # we arm it fresh with no prior DISABLE history).
+            bp_key = (id(code), line_number)
+            if bp_key in self._bp_pause_pending:
+                # Remove first so re-entrant calls don't double-fire.
+                self._bp_pause_pending.pop(bp_key, None)
+                # ── Hit bp cleanup ─────────────────────────────────────
+                # When a hit has multiple bps (primary + safety-net), the
+                # first one to fire must remove ALL pydevd bps for that hit
+                # (both siblings AND the fired bp itself). Two reasons:
+                #
+                # 1. Sibling disarm: prevents the unfired safety-net from
+                #    causing a spurious pause when execution reaches it later.
+                # 2. Fired bp removal: prevents pydevd's own DEBUGGER_ID
+                #    py_line_callback from seeing the LineBreakpoint and
+                #    causing a SECOND pause at the same location. This is
+                #    the dual-path architectural fix – our _TOOL_ID callback
+                #    and pydevd's DEBUGGER_ID callback both fire for LINE
+                #    events in user code, and only removing the bp itself
+                #    prevents the double-pause.
+                #
+                # Our _trigger_direct_pause uses do_wait_suspend directly –
+                # it does NOT need the pydevd LineBreakpoint to be present.
+                # So removing it before calling _trigger_direct_pause is safe.
+                fired_file = code.co_filename
+                hit_bps_to_remove = []
+                with self._lock:
+                    for h in self._hit_queue:
+                        locs = h.get("bp_locations", [])
+                        if any(l[0] == fired_file and l[1] == line_number
+                               for l in locs):
+                            # Found the owning hit – remove ALL pydevd bps
+                            # (fired + siblings). The fired bp must also be
+                            # removed: our _trigger_direct_pause uses
+                            # do_wait_suspend directly (doesn't need the
+                            # pydevd LineBreakpoint), and leaving it installed
+                            # causes pydevd's DEBUGGER_ID py_line_callback to
+                            # fire independently and produce a second pause.
+                            for loc in locs:
+                                sib_code = loc[2] if len(loc) > 2 else None
+                                # Remove siblings from _bp_pause_pending.
+                                # (The fired one was already popped above.)
+                                if not (loc[0] == fired_file
+                                        and loc[1] == line_number):
+                                    sib_key = (
+                                        (id(sib_code), loc[1])
+                                        if sib_code else None
+                                    )
+                                    if (sib_key
+                                            and sib_key in self._bp_pause_pending):
+                                        self._bp_pause_pending.pop(
+                                            sib_key, None)
+                                # Collect ALL pydevd bps for removal
+                                # (including the fired one).
+                                bp_loc = (loc[0], loc[1])
+                                for t in self._temp_breakpoints:
+                                    if (t[0], t[1]) == bp_loc:
+                                        hit_bps_to_remove.append(t)
+                            # Remove collected bps from the tracking list.
+                            if hit_bps_to_remove:
+                                self._temp_breakpoints = [
+                                    t for t in self._temp_breakpoints
+                                    if t not in hit_bps_to_remove
+                                ]
+                            break
+                # Remove the actual pydevd LineBreakpoints OUTSIDE the
+                # lock to avoid lock-order inversion with pydevd's locks.
+                if hit_bps_to_remove:
+                    _sib_py_db = _get_pydevd_debugger()
+                    if _sib_py_db is not None:
+                        _remove_temp_breakpoints(_sib_py_db, hit_bps_to_remove)
+                    _log_warn(
+                        f"_on_line: disarm removed {len(hit_bps_to_remove)} "
+                        f"pydevd bp(s) for hit at {fired_file}:{line_number}"
+                    )
+                # ── End hit bp cleanup ─────────────────────────────────
+                self._trigger_direct_pause(code, line_number)
+                return
+            # ── End direct-pause mechanism ────────────────────────────────
+
             frame = sys._getframe(1)
             fid = id(frame)
 
@@ -1174,6 +1365,47 @@ class WatchpointRegistry:
                 )
         finally:
             self._guard.active = False
+
+    def _trigger_direct_pause(self, code: Any, line_number: int) -> None:
+        """Trigger a pydevd pause directly from our monitoring callback.
+
+        Called when our _on_line (on _TOOL_ID) matches a pending bp target.
+        This bypasses pydevd's py_line_callback entirely – solving the case
+        where pydevd's DEBUGGER_ID LINE callback doesn't fire for a library
+        code object whose PY_START was DISABLEd before our bp existed.
+
+        Uses do_wait_suspend on the user's frame (not our runtime frame) so
+        the IDE shows the correct file/line. The frame is obtained via
+        sys._getframe(2): frame(0)=_trigger_direct_pause,
+        frame(1)=_on_line, frame(2)=the user's code where LINE fired.
+        """
+        try:
+            import threading
+            from _pydevd_bundle.pydevd_comm_constants import CMD_SET_BREAK
+
+            py_db = _get_pydevd_debugger()
+            if py_db is None or getattr(py_db, "_finish_debugging_session", False):
+                return
+
+            # frame(0) = this method
+            # frame(1) = _on_line (our callback)
+            # frame(2) = the actual user/library frame where LINE fired
+            user_frame = sys._getframe(2)
+            thread = threading.current_thread()
+
+            _log_warn(
+                f"_trigger_direct_pause: firing for "
+                f"{user_frame.f_code.co_filename}:{line_number} "
+                f"(direct pause via _TOOL_ID callback)"
+            )
+
+            py_db.set_suspend(thread, CMD_SET_BREAK, suspend_other_threads=False)
+            py_db.do_wait_suspend(thread, user_frame, 'line', None)
+        except Exception as e:  # noqa: BLE001
+            _log_warn(
+                f"_trigger_direct_pause: failed ({e!r}); "
+                f"pause may not materialise for this hit."
+            )
 
     def _on_py_return(self, code: Any, instruction_offset: int, retval: Any) -> None:
         """PY_RETURN callback – fires on NORMAL return only (not exception unwind).
@@ -1259,83 +1491,465 @@ class WatchpointRegistry:
             )
             return  # one pause per LINE event – any other watches will fire on their next change
 
+    def _next_slot_for_code(self, code: Any,
+                            start_line: int) -> Optional[int]:
+        """Find next available bp slot in `code`, considering existing hits.
+
+        Walks all queued hits' `bp_locations` and collects lines used in
+        this code object, plus in-flight reservations from other threads.
+        Returns the next code line strictly after the max used line (or
+        after `start_line` if nothing used yet), and reserves it immediately.
+        `_next_code_line_in` uses `co_lines()` so blank lines / lines past
+        the last statement are skipped – pydevd's `py_line_callback`
+        doesn't fire for those.
+        """
+        with self._lock:
+            used_lines = []
+            for h in self._hit_queue:
+                for loc in h.get("bp_locations", []):
+                    if loc[2] is code:
+                        used_lines.append(loc[1])
+            code_id = id(code)
+            for reserved_code_id, reserved_line in self._bp_slot_reservations:
+                if reserved_code_id == code_id:
+                    used_lines.append(reserved_line)
+            if used_lines:
+                # Never search backward past the current mutation line –
+                # a previous hit's bp_location can be before start_line
+                # (e.g. feature_contexts bp at 287, then
+                # external_feature_contexts mutates at 288). Without this
+                # max(), we'd pick 288 (the mutation line itself) which has
+                # already executed and a bp there will never fire.
+                search_after = max(max(used_lines), start_line)
+                candidate = _next_code_line_in(code, search_after)
+            else:
+                candidate = _next_code_line_in(code, start_line)
+            if candidate is not None:
+                self._bp_slot_reservations.add((id(code), candidate))
+            return candidate
+
+    def _bp_line_used_for_code(self, code: Any, line: int) -> bool:
+        """Return True if a queued hit already owns `line` in `code`.
+
+        The bytecode-order primary selector bypasses `_next_slot_for_code`,
+        so it needs this small collision check to preserve the one-hit-per-line
+        invariant that selective draining relies on.
+        """
+        with self._lock:
+            return ((id(code), line) in self._bp_slot_reservations
+                    or any(
+                loc[2] is code and loc[1] == line
+                for h in self._hit_queue
+                for loc in h.get("bp_locations", [])
+            ))
+
+    def _release_bp_slot_reservation(self, code: Any, line: int) -> None:
+        """Drop an in-flight reservation once install succeeds or fails."""
+        with self._lock:
+            self._bp_slot_reservations.discard((id(code), line))
+
+    def _next_slot_after_frame(self, frame: Any) -> Optional[int]:
+        """Find the next unused LINE event after `frame.f_lasti`.
+
+        Numeric source order is wrong for multi-line RHS calls. In
+        `request.parsed = ParsedRequest(...)`, the STORE_ATTR still belongs
+        to line 105, but bytecode for lines 106-112 has already run. The next
+        usable pause is the next LINE event after STORE_ATTR, line 114.
+        """
+        candidate = _next_code_line_after_frame(frame)
+        while candidate is not None:
+            with self._lock:
+                if not self._bp_line_used_for_code(frame.f_code, candidate):
+                    self._bp_slot_reservations.add((id(frame.f_code), candidate))
+                    return candidate
+            candidate = _next_code_line_in(frame.f_code, candidate)
+        return candidate
+
+    def _compute_bp_targets(self, user_frame: Any,
+                            source_line: Optional[int] = None) -> list:
+        """Compute bp slot(s) for a hit – primary + safety-net.
+
+        Returns a list of `(file, line, code_object)` tuples that
+        `_handle_hit` then installs as `LineBreakpoint`s. Each is a
+        slot for a single bp. When one fires, `_trigger_direct_pause`
+        removes sibling bps for the same hit synchronously – preventing
+        the safety-net from causing a spurious second pause.
+
+        Why two slots:
+        - **Primary (mutation site)**: `user_frame.f_code` at the next
+          code line after the mutation in bytecode order when possible,
+          otherwise the next numeric code line. The bytecode-order path
+          matters for multi-line calls like `request.parsed = ParsedRequest(...)`:
+          by the time STORE_ATTR fires on line 105, argument lines 106-112
+          have already executed, so a bp on line 106 can never fire.
+        - **Safety (walked-up user code)**: the nearest user-code frame
+          via `_find_user_code_caller`. Ensures a pause even when the
+          primary's LINE event doesn't fire.
+
+        Sequential allocation: when N hits target the same code object,
+        `_next_slot_for_code` returns successive lines so each hit
+        gets its own bp.
+
+        Returns an empty list when NEITHER slot is available (the
+        `script.py` last-line-of-module corner case). Caller falls
+        back to `_pause_via_do_wait_suspend`.
+        """
+        targets: list = []
+
+        # Primary: user_frame's code (mutation site). If the hit was raised
+        # directly from the mutating line (attribute/classpatch watchers),
+        # prefer the next LINE event after the current bytecode offset. This
+        # skips already-executed continuation lines in multi-line statements.
+        primary_line = None
+        if source_line is not None and source_line == user_frame.f_lineno:
+            primary_line = self._next_slot_after_frame(user_frame)
+        if primary_line is None:
+            primary_line = self._next_slot_for_code(
+                user_frame.f_code, user_frame.f_lineno,
+            )
+        if primary_line is not None:
+            targets.append((
+                user_frame.f_code.co_filename, primary_line, user_frame.f_code,
+            ))
+        else:
+            # Primary exhausted (mutation is on the function's last code
+            # line – e.g. `_authorization` ends at line 288 with no follow-up).
+            # Walk f_back to find the NEAREST caller frame with a valid next
+            # code line. This gives a much more contextual pause location
+            # than jumping straight to the distant user-code safety net.
+            # Example: for `_authorization` called via an OpenTelemetry
+            # decorator, the wrapper's caller or the view's dispatch line
+            # is contextually closer than audit_logging middleware 30 frames up.
+            f = user_frame.f_back
+            hops = 0
+            while f is not None and hops < _MAX_FRAME_WALK_HOPS:
+                # Skip our own runtime frames.
+                if f.f_code.co_filename in _RUNTIME_FILENAMES:
+                    f = f.f_back
+                    hops += 1
+                    continue
+                caller_line = self._next_slot_for_code(
+                    f.f_code, f.f_lineno,
+                )
+                if caller_line is not None:
+                    targets.append((
+                        f.f_code.co_filename, caller_line, f.f_code,
+                    ))
+                    _log_warn(
+                        f"_compute_bp_targets: primary exhausted, using "
+                        f"f_back intermediate at "
+                        f"{f.f_code.co_filename}:{caller_line} "
+                        f"(hops={hops})"
+                    )
+                    break
+                f = f.f_back
+                hops += 1
+
+        # Safety: nearest walked-up user-code frame. Ensures a pause even
+        # when pydevd's monitoring fails to fire LINE events for the primary's
+        # library code (openapi_validate_request is the known example: bps
+        # install but never fire because PY_START was DISABLEd before our bp).
+        # Spurious double-pauses are prevented by _trigger_direct_pause
+        # removing sibling bps synchronously when the first bp fires.
+        safety_frame = _find_user_code_caller(user_frame)
+        if (safety_frame is not None
+                and safety_frame.f_code is not user_frame.f_code):
+            safety_line = self._next_slot_for_code(
+                safety_frame.f_code, safety_frame.f_lineno,
+            )
+            if safety_line is not None:
+                cand = (safety_frame.f_code.co_filename, safety_line)
+                # Dedup: don't install twice at the same (file, line).
+                if not any((t[0], t[1]) == cand for t in targets):
+                    targets.append((
+                        safety_frame.f_code.co_filename,
+                        safety_line,
+                        safety_frame.f_code,
+                    ))
+                else:
+                    self._release_bp_slot_reservation(
+                        safety_frame.f_code, safety_line,
+                    )
+
+        return targets
+
     def _handle_hit(self, user_frame: Any, watch_name: str,
                     old_repr: str, new_repr: str,
                     source_file: str, source_line: int) -> None:
         """Pause the debugger via pydevd; if pydevd isn't loaded, raise the exception.
 
-        Using pydevd's do_wait_suspend gives a clean stack view – the IDE shows
-        the user's frame as the stopped frame, not our LINE-callback frames –
-        and clicking Resume continues execution silently rather than re-throwing
-        WatchpointHit out of the user's code.
+        Each hit installs its OWN pydevd `LineBreakpoint` (design contract §13
+        + the post-v8 sequential-bps refinement, see `_compute_bp_target`).
+        N back-to-back mutations at the same user-code anchor install N bps
+        at SUCCESSIVE code lines (80, 81, 82, ...). The IDE then pauses N
+        times in line order. `_pycharm_consume_last_hit(pause_file, pause_line)`
+        drains the one hit whose bp triggered THIS pause; the others stay
+        queued for their future pauses. This replaces the previous
+        process-level `_pause_pending` gate which dropped hits 2..N silently.
 
-        The raise fallback keeps the test suite working under plain pytest where
-        pydevd is not present in the environment.
+        Pause anchor: `user_frame` is the immediate mutation frame (e.g.
+        `query.py:289` when Django's `_clone` does `self._hints = ...`).
+        That frame is often inside `site-packages`. We still require a
+        user-code frame somewhere in the call chain so pure-library
+        side-effects stay silent, but the primary bp itself is anchored on
+        the mutation frame.
+
+        The raise fallback keeps the test suite working under plain pytest
+        where pydevd is not present in the environment.
         """
-        _dbg_log(
-            f"_handle_hit: name={watch_name!r}, file={source_file}:{source_line}, "
-            f"old={old_repr!r}, new={new_repr!r}, backend={_detect_debugger()}"
+        _log_warn(
+            f"_handle_hit ENTRY: watch={watch_name!r} "
+            f"user_frame={user_frame.f_code.co_filename}:{user_frame.f_lineno} "
+            f"source={source_file}:{source_line} "
+            f"queue_len={len(self._hit_queue)}"
         )
-        # Publish the hit BEFORE we hand off to pydevd. The IDE plugin's
-        # session-paused listener calls `_pycharm_consume_last_hit` once the
-        # pause has materialised; whichever pause path we take below, this
-        # field is the single source of truth for "what just fired".
-        with self._lock:
-            self._last_hit = {
-                "file": source_file,
-                "line": source_line,
-                "name": watch_name,
-                "old": old_repr,
-                "new": new_repr,
-            }
 
-        # Also emit a structured stderr marker the IDE can parse without an eval.
-        # The PyDebugProcess.evaluate(..., doTrunc=false) path that `_pycharm_consume_last_hit`
-        # was designed for is pydevd-only; under debugpy the generic XDebuggerEvaluator
-        # truncates base64 payloads so the IDE can't reconstruct the hit. Routing the
-        # same payload through the process's stderr stream sidesteps both problems –
-        # the plugin attaches a ProcessListener and consumes the marker on every hit,
-        # working identically under pydevd, debugpy, and any future backend.
-        _emit_hit_marker(self._last_hit)
-
-        py_db = _get_pydevd_debugger()
-        if py_db is not None:
-            try:
-                _pause_via_pydevd(py_db, user_frame, watch_name, old_repr, new_repr,
-                                  source_file, source_line)
-                return
-            except Exception as e:  # noqa: BLE001
-                global _pydevd_last_error
-                _pydevd_last_error = f"do_wait_suspend failed: {e!r}"
-                _log_warn(
-                    f"pause-via-pydevd failed ({e!r}); diag: {_pycharm_watchpoint_diag()}"
-                )
-
-        # Pause failed. Choose between raising and silently logging based on the
-        # detected backend:
-        #   pydevd → raise. The plugin's `WatchpointDebugListener` registered a
-        #            `PyExceptionBreakpointType` for `watchpoint.WatchpointHit`,
-        #            so pydevd catches the raise and pauses cleanly. This is the
-        #            no-pydevd-fallback-but-pydevd-is-loaded edge case (rare).
-        #   debugpy → don't raise. debugpy doesn't honor `PyExceptionBreakpointType`,
-        #             so the exception would propagate uncaught and KILL the user's
-        #             program. Better UX: log the hit to stderr (Debug Console)
-        #             and let execution continue. The user sees `[WATCHPOINT] hit
-        #             '...': old -> new at file:line` and knows what happened.
-        #   none → raise. Same as pydevd, except now `WatchpointHit` propagates as
-        #          a real Python exception, which is what the test suite asserts on.
-        backend = _detect_debugger()
-        if backend == "debugpy":
+        # Suppress side-effect mutations fired during our own installation
+        # flow (e.g. getattr triggering SimpleLazyObject lazy eval which
+        # writes back to the watched object via __setattr__). Only suppress
+        # on the same thread that's doing the installation – real mutations
+        # on other user threads must still fire.
+        if _installing_watch_thread == threading.get_ident():
             _log_warn(
-                f"hit '{watch_name}': {old_repr} -> {new_repr} at {source_file}:{source_line} "
-                f"(debugpy: pause not yet implemented – execution continues)"
+                f"_handle_hit: SUPPRESSED (during installation) for {watch_name!r}"
             )
             return
+
+        # Declared up-front for both exception branches below (Python
+        # rejects multiple `global` declarations in the same function).
+        global _pydevd_last_error
+
+        # Use `user_frame` itself as the bp anchor – the IDE pauses at
+        # the next code line in the SAME file where the mutation
+        # happened, which is much more contextual than the previous
+        # behavior of walking up past site-packages and pausing in
+        # whichever distant user-code frame called into the library.
+        #
+        # The design contract §12 walk-up was a workaround for
+        # `CMD_STEP_OVER + step_stop = library_frame` being filtered by
+        # PyCharm's "do not step into library code" setting. We no
+        # longer use CMD_STEP_OVER; we use `LineBreakpoint`s installed
+        # via `consolidate_breakpoints` – the same path user-set
+        # breakpoints take, which fires reliably in library code. So
+        # the walk-up is no longer needed for the filter-bypass reason
+        # and just produces less contextual pauses.
+        #
+        # Drop-on-pure-library-chain (no user code anywhere in 32 hops)
+        # is still preserved: when the entire stack is library / runtime
+        # (descriptor side-effects, pydevd machinery, etc.) firing a
+        # watchpoint hit is more confusing than silent. The detection
+        # uses `_find_user_code_caller` purely as a "does user code
+        # exist somewhere" check – we don't actually use the walked-up
+        # frame as the anchor anymore.
+        if _find_user_code_caller(user_frame) is None:
+            _log_warn(
+                f"_handle_hit: NO USER FRAME in chain for {watch_name!r}; "
+                f"dropping hit (highlight + pause both suppressed)"
+            )
+            return
+        pause_anchor = user_frame
         _log_warn(
-            f"pydevd debugger not found / pause failed; raising WatchpointHit. "
-            f"Diag: {_pycharm_watchpoint_diag()}"
+            f"_handle_hit: pause_anchor="
+            f"{pause_anchor.f_code.co_filename}:{pause_anchor.f_lineno} "
+            f"(using user_frame directly as the mutation anchor)"
         )
-        raise WatchpointHit(watch_name, old_repr, new_repr, source_file, source_line)
+
+        # Capture the direct parent frame's location – this is the frame
+        # that called the function where the mutation happened. Its f_lineno
+        # at this moment is the exact call-site line. The Kotlin side uses
+        # this for the secondary "call-site" highlight so it can mark the
+        # exact call expression rather than guessing offsets from the bp's
+        # fire location.
+        #
+        # We use f_back (direct caller) rather than _find_user_code_caller
+        # because the latter skips site-packages/stdlib and lands in distant
+        # user code (e.g. audit_logging middleware) which is not contextually
+        # useful for "this call triggered the watchpoint."
+        parent = user_frame.f_back
+        caller_file = parent.f_code.co_filename if parent else ""
+        caller_line = parent.f_lineno if parent else 0
+
+        py_db = _get_pydevd_debugger()
+
+        # No pydevd ⇒ standalone / pytest run. The hit queue is only
+        # useful as a buffer between `_handle_hit` and the IDE-side
+        # drain; without pydevd there IS no IDE-side drain, so skip
+        # the queue + slot-allocator entirely and raise so the test
+        # suite (or any non-IDE caller) can catch the event directly.
+        if py_db is None:
+            _log_warn(
+                f"_handle_hit: pydevd not found for {watch_name!r}; "
+                f"raising WatchpointHit. Diag: {_pycharm_watchpoint_diag()}"
+            )
+            raise WatchpointHit(
+                watch_name, old_repr, new_repr, source_file, source_line,
+            )
+
+        # Compute bp slots for THIS hit. Each entry is a (file, line, code)
+        # tuple. Up to TWO slots: primary at the mutation site, safety
+        # at the walked-up user-code frame. Empty list ⇒ no slots
+        # available anywhere (last-line-of-module corner case).
+        targets = self._compute_bp_targets(pause_anchor, source_line)
+
+        # Now that we know where the bp will fire (targets[0] file), refine
+        # the caller info: walk up from user_frame to find the frame that's
+        # in the SAME file as the bp target. That frame's f_lineno is the
+        # call-site line the user expects to see highlighted (e.g.
+        # "self._authorization(request)" in dispatch when the mutation is
+        # deep inside _authorization's call chain via contextlib/etc.).
+        #
+        # Falls back to the direct parent (user_frame.f_back) when no
+        # ancestor matches the bp file – still more useful than nothing.
+        if targets:
+            bp_file = targets[0][0]
+            f = user_frame.f_back
+            hops = 0
+            while f is not None and hops < _MAX_FRAME_WALK_HOPS:
+                if f.f_code.co_filename == bp_file:
+                    caller_file = f.f_code.co_filename
+                    caller_line = f.f_lineno
+                    break
+                f = f.f_back
+                hops += 1
+
+        with self._lock:
+            queue_was_empty = len(self._hit_queue) == 0
+
+        if not targets:
+            # No slots available. If the queue is non-empty, drop –
+            # the user has already been notified of prior hits and
+            # a stack-blocking do_wait_suspend would be worse than
+            # silence. If the queue IS empty, this is the very first
+            # hit and we MUST honor the user's `watch(...)` request,
+            # so fall back to do_wait_suspend with the urllib-on-stack
+            # trade-off.
+            if not queue_was_empty:
+                _log_warn(
+                    f"_handle_hit: no bp slots for {watch_name!r} "
+                    f"(neither {pause_anchor.f_code.co_filename} nor walked-up "
+                    f"user code have a next code line, and queue is "
+                    f"non-empty); dropping hit"
+                )
+                return
+            try:
+                hit = {
+                    "file": source_file,
+                    "line": source_line,
+                    "name": watch_name,
+                    "old": old_repr,
+                    "new": new_repr,
+                    "caller_file": caller_file,
+                    "caller_line": caller_line,
+                    "bp_locations": [],  # untagged ⇒ next consume any-location matches
+                }
+                with self._lock:
+                    self._last_hit = hit
+                    self._hit_queue.append(hit)
+                _log_warn(
+                    f"_handle_hit: no bp slots for {watch_name!r}; "
+                    f"falling back to do_wait_suspend at "
+                    f"{pause_anchor.f_code.co_filename}:{pause_anchor.f_lineno}"
+                )
+                if not _pause_via_do_wait_suspend(
+                    py_db, pause_anchor, watch_name,
+                ):
+                    _log_warn(
+                        f"_handle_hit: fallback do_wait_suspend also "
+                        f"failed for {watch_name!r}; no pause possible "
+                        f"for this mutation."
+                    )
+                return
+            except Exception as e:  # noqa: BLE001
+                _pydevd_last_error = f"do_wait_suspend failed: {e!r}"
+                _log_warn(
+                    f"pause-via-pydevd failed ({e!r}); falling back to raise. "
+                    f"Diag: {_pycharm_watchpoint_diag()}"
+                )
+                raise WatchpointHit(
+                    watch_name, old_repr, new_repr, source_file, source_line,
+                )
+
+        # Queue the hit FIRST (before install) so async bp firing can
+        # find it. We populate `bp_locations` as each install succeeds.
+        hit = {
+            "file": source_file,
+            "line": source_line,
+            "name": watch_name,
+            "old": old_repr,
+            "new": new_repr,
+            "caller_file": caller_file,
+            "caller_line": caller_line,
+            "bp_locations": [],
+        }
+        with self._lock:
+            self._last_hit = hit
+            self._hit_queue.append(hit)
+            if len(self._hit_queue) > _MAX_HIT_QUEUE_SIZE:
+                # Trim oldest – ancient queued hits past the cap are less
+                # likely to fire (their bps may have been lost on session
+                # restart). Keep the most recent N.
+                del self._hit_queue[
+                    : len(self._hit_queue) - _MAX_HIT_QUEUE_SIZE
+                ]
+
+        installed_any = False
+        for (target_file, target_line, target_code) in targets:
+            try:
+                installed = _install_bp_at(
+                    py_db, target_code, target_file, target_line, watch_name,
+                )
+                if installed is not None:
+                    with self._lock:
+                        self._temp_breakpoints.append(installed)
+                        hit["bp_locations"].append(
+                            (installed[0], installed[1], target_code)
+                        )
+                        self._bp_slot_reservations.discard(
+                            (id(target_code), target_line)
+                        )
+                    installed_any = True
+                    _log_warn(
+                        f"_handle_hit: pause ARMED for {watch_name!r} at "
+                        f"{installed[0]}:{installed[1]} (one of "
+                        f"{len(targets)} slots)"
+                    )
+                else:
+                    self._release_bp_slot_reservation(target_code, target_line)
+            except Exception as e:  # noqa: BLE001
+                self._release_bp_slot_reservation(target_code, target_line)
+                _pydevd_last_error = f"bp install failed: {e!r}"
+                _log_warn(
+                    f"_handle_hit: bp install at {target_file}:{target_line} "
+                    f"raised ({e!r}); continuing to next target."
+                )
+
+        if installed_any:
+            return
+
+        # All installs failed – the queued hit has empty `bp_locations`,
+        # so the next selective drain at ANY location will pick it up.
+        _log_warn(
+            f"_handle_hit: ALL bp installs failed for {watch_name!r}; "
+            f"falling back to do_wait_suspend"
+        )
+        try:
+            if not _pause_via_do_wait_suspend(
+                py_db, pause_anchor, watch_name,
+            ):
+                _log_warn(
+                    f"_handle_hit: fallback do_wait_suspend also failed "
+                    f"for {watch_name!r}; pause may not materialise."
+                )
+            return
+        except Exception as e:  # noqa: BLE001
+            _pydevd_last_error = f"pause failed: {e!r}"
+            _log_warn(
+                f"_handle_hit: fallback pause raised ({e!r}); raising "
+                f"WatchpointHit. Diag: {_pycharm_watchpoint_diag()}"
+            )
+            raise WatchpointHit(
+                watch_name, old_repr, new_repr, source_file, source_line,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1347,7 +1961,7 @@ class _LocalWatch:
 
     `frame_id` ties this watch to the specific frame instance where watch()
     was called. The watch is removed when that frame exits (PY_RETURN) or
-    is detected dead via the lazy zombie sweep in _on_line.
+    when PY_START detects the frame id was reused by a new frame.
 
     `display_name` is the name surfaced in `WatchpointHit.watch_name`. It
     matches `name` for directly-armed watches; for watches armed by
@@ -1382,7 +1996,8 @@ class _AttributeWatch:
     """
     __slots__ = ("expr", "obj_ref", "original_cls", "watcher_cls", "initial_repr",
                  "container_wrapper", "container_holder", "container_attr",
-                 "sub_watches", "classpatch_key")
+                 "sub_watches", "classpatch_key",
+                 "visited_ids", "sub_watches_capped")
 
     def __init__(self, expr: str, obj_ref: Any, original_cls: Optional[type],
                  watcher_cls: Optional[type], initial_repr: str) -> None:
@@ -1418,6 +2033,24 @@ class _AttributeWatch:
         # calls `_remove_classpatch_attr_watch(obj_ref, classpatch_key)`
         # when this is set.
         self.classpatch_key = None
+        # Persistent cycle-detection set, shared across the initial
+        # `_instrument_object_tree` walk AND every later re-entry triggered
+        # by the watcher's `__setattr__` hook. Storing it on the root watch
+        # (rather than passing a fresh set per __setattr__ call) is what
+        # stops Django-shaped object graphs whose descriptors fabricate new
+        # proxy instances on each access – the per-call sets never matched,
+        # so each re-entry started a brand-new depth-4 walk and the
+        # instrumentation snowballed past the depth limit. See
+        # `_FRAMEWORK_MODULE_ROOTS` / `_is_user_defined_type` for the
+        # complementary first-line defence; this set is what catches truly
+        # cyclic user-defined graphs the type filter doesn't.
+        self.visited_ids: set = set()
+        # Belt-and-suspenders breadth cap. Set to True by
+        # `_try_add_sub_watch` once `len(sub_watches) >=
+        # _MAX_SUB_WATCHES_PER_ROOT`. Recursive walks check this and
+        # bail out so a missed cycle can't grow the watch tree forever.
+        # One warning logged per root the first time the cap engages.
+        self.sub_watches_capped: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -1453,16 +2086,40 @@ def _wp_container_repr(value: Any) -> str:
     We delegate to `list.__repr__` / `dict.__repr__` / `set.__repr__`
     explicitly so a future subclass-of-subclass that overrides `__repr__`
     can't recurse into our firing path.
+
+    Returns `"<unreprable>"` if the repr raises. This is load-bearing:
+    container `__repr__` recursively reprs every contained value, and
+    a half-constructed contained value (e.g., a Django Model being
+    rebuilt mid-`copy.deepcopy`) can raise from its own `__repr__`
+    /`__str__` (Django Model.__str__ accesses fields via descriptors
+    that read `_state.fields_cache`, which doesn't exist yet during
+    `_reconstruct`). Without this guard, our `_WatchedDict.__setitem__`
+    on `deepcopy`'s memo dict propagates that AttributeError out of
+    deepcopy and KILLS THE USER'S CODE.
+
+    User-reported scenario: watching `self` on a Django TestCase. The
+    recursive walker wraps `self._testdata_memo` (a plain dict) as
+    `_WatchedDict`. Django's TestCase machinery passes that very dict
+    as `copy.deepcopy(value, memo=cls._testdata_memo)`. Deepcopy does
+    `memo[id(x)] = y` with `y` mid-reconstruction → our `__setitem__`
+    snapshots the dict via `dict.__repr__` → iterates values → calls
+    `repr` on the half-built Django Model → AttributeError → propagates.
+
+    Result of the guard: when before- and after-snapshots both come
+    back as `"<unreprable>"`, they compare equal, no hit fires, and
+    the underlying `dict.__setitem__` mutation (already applied by
+    the caller's mutating-method wrapper) is the only effect –
+    exactly as if the value couldn't fire a change-detection event.
     """
-    if isinstance(value, list):
-        return list.__repr__(value)
-    if isinstance(value, dict):
-        return dict.__repr__(value)
-    if isinstance(value, set):
-        return set.__repr__(value)
     try:
+        if isinstance(value, list):
+            return list.__repr__(value)
+        if isinstance(value, dict):
+            return dict.__repr__(value)
+        if isinstance(value, set):
+            return set.__repr__(value)
         return repr(value)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return "<unreprable>"
 
 
@@ -1499,6 +2156,14 @@ def _wp_fire_container_change(self: Any, old_repr_full: str,
         caller = sys._getframe(frame_skip)
     except Exception:
         return
+    # Walk past our own runtime frames so the hit's reported file/line is
+    # the user's mutation call, not the container method's internal
+    # `super().append(...)` etc. inside watchpoint.py. If every frame is
+    # runtime (mutation triggered by a descriptor side-effect during IDE
+    # display), drop the hit rather than flood pydevd's queue.
+    user_caller = _find_user_caller(caller)
+    if user_caller is None:
+        return
 
     registry._guard.active = True
     try:
@@ -1507,12 +2172,12 @@ def _wp_fire_container_change(self: Any, old_repr_full: str,
         old_display = old_repr_full if len(old_repr_full) <= 200 else old_repr_full[:200] + "..."
         new_display = new_repr_full if len(new_repr_full) <= 200 else new_repr_full[:200] + "..."
         registry._handle_hit(
-            user_frame=caller,
+            user_frame=user_caller,
             watch_name=expr,
             old_repr=old_display,
             new_repr=new_display,
-            source_file=caller.f_code.co_filename,
-            source_line=caller.f_lineno,
+            source_file=user_caller.f_code.co_filename,
+            source_line=user_caller.f_lineno,
         )
     finally:
         registry._guard.active = False
@@ -1547,65 +2212,65 @@ class _WatchedList(list):
         self.__dict__["_wp_expr"] = expr
 
     def append(self, item: Any) -> None:  # noqa: D401
-        old = list.__repr__(self)
+        old = _wp_container_repr(self)
         list.append(self, item)
         _wp_fire_container_change(self, old)
 
     def extend(self, items: Any) -> None:
-        old = list.__repr__(self)
+        old = _wp_container_repr(self)
         list.extend(self, items)
         _wp_fire_container_change(self, old)
 
     def insert(self, index: int, item: Any) -> None:
-        old = list.__repr__(self)
+        old = _wp_container_repr(self)
         list.insert(self, index, item)
         _wp_fire_container_change(self, old)
 
     def remove(self, item: Any) -> None:
-        old = list.__repr__(self)
+        old = _wp_container_repr(self)
         list.remove(self, item)
         _wp_fire_container_change(self, old)
 
     def pop(self, *args: Any) -> Any:
-        old = list.__repr__(self)
+        old = _wp_container_repr(self)
         result = list.pop(self, *args)
         _wp_fire_container_change(self, old)
         return result
 
     def clear(self) -> None:
-        old = list.__repr__(self)
+        old = _wp_container_repr(self)
         list.clear(self)
         _wp_fire_container_change(self, old)
 
     def sort(self, *args: Any, **kwargs: Any) -> None:
-        old = list.__repr__(self)
+        old = _wp_container_repr(self)
         list.sort(self, *args, **kwargs)
         _wp_fire_container_change(self, old)
 
     def reverse(self) -> None:
-        old = list.__repr__(self)
+        old = _wp_container_repr(self)
         list.reverse(self)
         _wp_fire_container_change(self, old)
 
     def __setitem__(self, key: Any, value: Any) -> None:
-        old = list.__repr__(self)
+        old = _wp_container_repr(self)
         list.__setitem__(self, key, value)
         _wp_fire_container_change(self, old)
 
     def __delitem__(self, key: Any) -> None:
-        old = list.__repr__(self)
+        old = _wp_container_repr(self)
         list.__delitem__(self, key)
         _wp_fire_container_change(self, old)
 
     def __iadd__(self, other: Any) -> "list":
-        old = list.__repr__(self)
+        old = _wp_container_repr(self)
         # list.__iadd__ returns self – preserve that contract.
         result = list.__iadd__(self, other)
         _wp_fire_container_change(self, old)
         return result
 
     def __imul__(self, other: int) -> "list":
-        old = list.__repr__(self)
+        old = _wp_container_repr(self)
         result = list.__imul__(self, other)
         _wp_fire_container_change(self, old)
         return result
@@ -1624,46 +2289,46 @@ class _WatchedDict(dict):
         self.__dict__["_wp_expr"] = expr
 
     def __setitem__(self, key: Any, value: Any) -> None:
-        old = dict.__repr__(self)
+        old = _wp_container_repr(self)
         dict.__setitem__(self, key, value)
         _wp_fire_container_change(self, old)
 
     def __delitem__(self, key: Any) -> None:
-        old = dict.__repr__(self)
+        old = _wp_container_repr(self)
         dict.__delitem__(self, key)
         _wp_fire_container_change(self, old)
 
     def pop(self, *args: Any, **kwargs: Any) -> Any:
-        old = dict.__repr__(self)
+        old = _wp_container_repr(self)
         result = dict.pop(self, *args, **kwargs)
         _wp_fire_container_change(self, old)
         return result
 
     def popitem(self) -> Any:
-        old = dict.__repr__(self)
+        old = _wp_container_repr(self)
         result = dict.popitem(self)
         _wp_fire_container_change(self, old)
         return result
 
     def clear(self) -> None:
-        old = dict.__repr__(self)
+        old = _wp_container_repr(self)
         dict.clear(self)
         _wp_fire_container_change(self, old)
 
     def update(self, *args: Any, **kwargs: Any) -> None:
-        old = dict.__repr__(self)
+        old = _wp_container_repr(self)
         dict.update(self, *args, **kwargs)
         _wp_fire_container_change(self, old)
 
     def setdefault(self, key: Any, default: Any = None) -> Any:
-        old = dict.__repr__(self)
+        old = _wp_container_repr(self)
         result = dict.setdefault(self, key, default)
         _wp_fire_container_change(self, old)
         return result
 
     def __ior__(self, other: Any) -> "dict":
         # 3.9+ adds `d |= other`. dict.__ior__ returns self.
-        old = dict.__repr__(self)
+        old = _wp_container_repr(self)
         result = dict.__ior__(self, other)
         _wp_fire_container_change(self, old)
         return result
@@ -1682,71 +2347,71 @@ class _WatchedSet(set):
         self.__dict__["_wp_expr"] = expr
 
     def add(self, item: Any) -> None:
-        old = set.__repr__(self)
+        old = _wp_container_repr(self)
         set.add(self, item)
         _wp_fire_container_change(self, old)
 
     def discard(self, item: Any) -> None:
-        old = set.__repr__(self)
+        old = _wp_container_repr(self)
         set.discard(self, item)
         _wp_fire_container_change(self, old)
 
     def remove(self, item: Any) -> None:
-        old = set.__repr__(self)
+        old = _wp_container_repr(self)
         set.remove(self, item)
         _wp_fire_container_change(self, old)
 
     def pop(self) -> Any:
-        old = set.__repr__(self)
+        old = _wp_container_repr(self)
         result = set.pop(self)
         _wp_fire_container_change(self, old)
         return result
 
     def clear(self) -> None:
-        old = set.__repr__(self)
+        old = _wp_container_repr(self)
         set.clear(self)
         _wp_fire_container_change(self, old)
 
     def update(self, *iterables: Any) -> None:
-        old = set.__repr__(self)
+        old = _wp_container_repr(self)
         set.update(self, *iterables)
         _wp_fire_container_change(self, old)
 
     def intersection_update(self, *iterables: Any) -> None:
-        old = set.__repr__(self)
+        old = _wp_container_repr(self)
         set.intersection_update(self, *iterables)
         _wp_fire_container_change(self, old)
 
     def difference_update(self, *iterables: Any) -> None:
-        old = set.__repr__(self)
+        old = _wp_container_repr(self)
         set.difference_update(self, *iterables)
         _wp_fire_container_change(self, old)
 
     def symmetric_difference_update(self, *iterables: Any) -> None:
-        old = set.__repr__(self)
+        old = _wp_container_repr(self)
         set.symmetric_difference_update(self, *iterables)
         _wp_fire_container_change(self, old)
 
     def __ior__(self, other: Any) -> "set":
-        old = set.__repr__(self)
+        old = _wp_container_repr(self)
         result = set.__ior__(self, other)
         _wp_fire_container_change(self, old)
         return result
 
     def __iand__(self, other: Any) -> "set":
-        old = set.__repr__(self)
+        old = _wp_container_repr(self)
         result = set.__iand__(self, other)
         _wp_fire_container_change(self, old)
         return result
 
     def __ixor__(self, other: Any) -> "set":
-        old = set.__repr__(self)
+        old = _wp_container_repr(self)
         result = set.__ixor__(self, other)
         _wp_fire_container_change(self, old)
         return result
 
     def __isub__(self, other: Any) -> "set":
-        old = set.__repr__(self)
+        old = _wp_container_repr(self)
         result = set.__isub__(self, other)
         _wp_fire_container_change(self, old)
         return result
@@ -1946,15 +2611,16 @@ def _install_classpatch_attr_watch(registry: "WatchpointRegistry",
                 watch_name = aw.expr if not wildcard else f"{aw.expr}.{name}"
                 _reg._guard.active = True
                 try:
-                    caller = sys._getframe(1)
-                    _reg._handle_hit(
-                        user_frame=caller,
-                        watch_name=watch_name,
-                        old_repr=_safe_repr(old_val),
-                        new_repr=_safe_repr(value),
-                        source_file=caller.f_code.co_filename,
-                        source_line=caller.f_lineno,
-                    )
+                    user_caller = _find_user_caller(sys._getframe(1))
+                    if user_caller is not None:
+                        _reg._handle_hit(
+                            user_frame=user_caller,
+                            watch_name=watch_name,
+                            old_repr=_safe_repr(old_val),
+                            new_repr=_safe_repr(value),
+                            source_file=user_caller.f_code.co_filename,
+                            source_line=user_caller.f_lineno,
+                        )
                 finally:
                     _reg._guard.active = False
 
@@ -2023,11 +2689,70 @@ def _safe_repr(value: Any) -> str:
 
 
 def _log_warn(msg: str) -> None:
-    """Write a one-line `[WATCHPOINT]` warning to stderr, never raise."""
+    """Write a one-line `[WATCHPOINT]` warning to stderr AND tee to a
+    diagnostic file, never raise.
+
+    Why the file tee: under pytest the default capture mode hides stderr,
+    so `[WATCHPOINT]` lines never reach the user's terminal or Debug
+    Console tab. Under sys.monitoring + pydevd's stdout/stderr
+    interception some lines also get rewritten or dropped. The file
+    sink at `/tmp/pythonwatchpoint.log` is the durable fallback the user
+    can `tail -f` during a debug session, regardless of capture
+    configuration.
+
+    File path is fixed (not env-driven) on purpose: when the user is
+    reporting a bug, "just look at /tmp/pythonwatchpoint.log" is one
+    less moving part than "set this env var before launching the IDE."
+    Append mode + truncation guard keeps growth bounded over long
+    sessions (we trim to the last ~1 MB when we cross 2 MB).
+    """
+    line = f"[WATCHPOINT] {msg}"
     try:
-        print(f"[WATCHPOINT] {msg}", file=sys.stderr, flush=True)
+        print(line, file=sys.stderr, flush=True)
     except Exception:
         pass
+    try:
+        import os as _os
+        path = "/tmp/pythonwatchpoint.log"
+        try:
+            if _os.path.exists(path) and _os.path.getsize(path) > 2_000_000:
+                with open(path, "rb") as fh:
+                    fh.seek(-1_000_000, 2)
+                    tail = fh.read()
+                with open(path, "wb") as fh:
+                    fh.write(tail)
+        except Exception:
+            pass
+        with open(path, "a", encoding="utf-8", errors="replace") as fh:
+            import datetime as _dt
+            ts = _dt.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            fh.write(f"{ts} {line}\n")
+    except Exception:
+        pass
+
+
+def _try_add_sub_watch(root_watch: "_AttributeWatch",
+                       sub_w: "_AttributeWatch") -> bool:
+    """Append `sub_w` to `root_watch.sub_watches` unless we've hit the
+    per-root cap. Returns True on success, False once the cap engages.
+
+    The first time the cap engages on a given root, a one-line warning is
+    logged naming the root expression so the user can see why their watch
+    isn't picking up deeper mutations. Subsequent caps on the same root
+    are silent.
+    """
+    if root_watch.sub_watches_capped:
+        return False
+    if len(root_watch.sub_watches) >= _MAX_SUB_WATCHES_PER_ROOT:
+        root_watch.sub_watches_capped = True
+        _log_warn(
+            f"watch '{root_watch.expr}': reached sub-watch cap "
+            f"({_MAX_SUB_WATCHES_PER_ROOT}); stopping deeper instrumentation. "
+            f"Likely cause: cyclic / framework-shaped object graph."
+        )
+        return False
+    root_watch.sub_watches.append(sub_w)
+    return True
 
 
 # Code-object flags that mean "calling this doesn't enter the body" – the
@@ -2126,6 +2851,297 @@ def _is_object_watchable(value: Any) -> bool:
     return type(value).__module__ != "builtins"
 
 
+# Module name roots whose types are framework / third-party code, not user
+# code. We refuse to RECURSE into objects of these types during
+# `_instrument_object_tree` (the root watch itself can still use whatever
+# strategy `add_watch` picks – class surgery, classpatch fallback, or
+# rebind detection). Without this filter, watching a Django QuerySet
+# explodes through `obj.model.user_id.field.remote_field.field.remote_field…`
+# because Django's ORM descriptors fabricate fresh proxy objects on each
+# access – id()-based cycle detection never matches – and reading those
+# descriptors does internal setattrs as a side effect, which OUR
+# __setattr__ then catches as "mutations" and re-recurses with a fresh
+# depth-1 walk. End result: hundreds of queued hits per Variables-panel
+# expansion and a frozen IDE.
+#
+# We *want* full coverage of user code; we *want* a clean stop at the
+# framework boundary. The Variables-panel display path then runs through
+# normal Django attribute access (no watcher in the way), so no queue
+# flood. A user who watches `my_dto` where `my_dto.queryset` is a Django
+# QuerySet still gets full instrumentation on `my_dto.*` and on any
+# user-defined sub-objects; we just stop walking when we reach
+# `my_dto.queryset` and leave it untouched.
+_FRAMEWORK_MODULE_ROOTS = frozenset({
+    "django", "sqlalchemy", "alembic",
+    "pydevd", "_pydevd", "_pydev_bundle", "_pydevd_bundle",
+    "_pydev_runfiles", "pydev_ipython", "pydevd_plugins",
+    "numpy", "pandas", "polars", "scipy", "sklearn",
+    "pydantic", "pydantic_core", "attr", "attrs", "marshmallow",
+    "werkzeug", "flask", "django_extensions",
+    "requests", "urllib3", "tornado", "aiohttp", "httpx", "starlette", "fastapi",
+    "tortoise", "peewee", "sqlmodel", "pony", "mongoengine",
+    "pytest", "_pytest", "pluggy",
+    "setuptools", "pkg_resources", "_distutils_hack",
+    # Our own runtime module is registered as "_pycharm_watchpoint" in sys.modules
+    # by the IDE's sitecustomize injection (see plugin's
+    # DebugWithWatchpointAction.injectViaSiteCustomize); make sure our
+    # dynamically-created watcher subclasses don't get re-instrumented.
+    # "watchpoint" is kept for test-mode where the file is imported by filename.
+    "_pycharm_watchpoint",
+    "watchpoint",
+})
+
+
+def _is_user_defined_type(t: Optional[type]) -> bool:
+    """Return True if `t` is a type from the user's own code (not stdlib,
+    not a known framework, not under site-packages / dist-packages).
+
+    Used by `_instrument_object_tree` (and the watcher's `__setattr__`
+    re-entry path) to decide whether to RECURSE into an attribute value.
+    The ROOT object the user passes is always considered watchable by
+    `add_watch`'s own logic; this helper only gates the recursive walk.
+
+    The check is intentionally cheap (called once per candidate attribute
+    during the depth-4 walk):
+
+    - reject non-types and `builtins`-module types,
+    - reject if the top-level module name is in `sys.stdlib_module_names`
+      (Python 3.10+) or `_FRAMEWORK_MODULE_ROOTS`,
+    - reject if `sys.modules[mod].__file__` lives under `site-packages`
+      or `dist-packages` (catches frameworks our denylist hasn't named).
+
+    Result is NOT cached: types are O(1) hashable but the cache leaks
+    references to one-off subclasses (a common pattern in metaclass-heavy
+    libraries), and the check itself is sub-microsecond.
+    """
+    if t is None or not isinstance(t, type):
+        return False
+    mod_name = getattr(t, "__module__", None)
+    if not mod_name or mod_name == "builtins":
+        return False
+    root = mod_name.partition(".")[0]
+    if root in _FRAMEWORK_MODULE_ROOTS:
+        return False
+    stdlib_names = getattr(sys, "stdlib_module_names", None)
+    if stdlib_names is not None and root in stdlib_names:
+        return False
+    mod = sys.modules.get(mod_name)
+    if mod is not None:
+        mod_file = getattr(mod, "__file__", None)
+        if mod_file is not None and (
+            "site-packages" in mod_file or "dist-packages" in mod_file
+        ):
+            return False
+    return True
+
+
+# How many sub-watches a single root can accumulate before we stop adding
+# more. Sub-watches come from `_instrument_object_tree` recursion + the
+# watcher's `__setattr__` re-entry path; the type-filter + persistent
+# visited set already prevent the runaway, but this is belt-and-suspenders
+# against any cyclic user-defined graph we missed. 100 is generous enough
+# for normal DTO trees (typically < 20 sub-watches) and small enough to
+# catch a runaway before pydevd's hit queue overflows.
+_MAX_SUB_WATCHES_PER_ROOT = 100
+
+
+# ---------------------------------------------------------------------------
+# Belt-and-suspenders caps for runaway scenarios.
+#
+# All three are "should never hit in practice; if you do, something is
+# genuinely pathological" limits. The dedupe gate keeps the hit queue at
+# 0-or-1 in normal use; the per-thread propagation queue self-drains on
+# every PY_START; the frame-walk safety only triggers on a degenerate
+# `f_back` chain that loops back on itself (which shouldn't happen but
+# has been observed under exotic frame manipulation libraries). 1024
+# matches Python's default recursion limit – above that, you'd be
+# hitting `RecursionError` from the interpreter before we'd hit it.
+#
+# Pulled out as named constants instead of inline literals so they
+# can be bumped from one place if a future use case exceeds them.
+# ---------------------------------------------------------------------------
+
+# Max entries the IDE-side hit queue (`WatchpointRegistry._hit_queue`)
+# retains. With the dedupe gate this is normally 0-or-1; the cap only
+# matters for test paths or bug scenarios where the gate isn't engaged.
+# When exceeded, the oldest entries are dropped (most recent are kept,
+# since they're the ones the IDE is most likely to want to show next).
+_MAX_HIT_QUEUE_SIZE = 1024
+
+# Max entries in the per-thread cross-function propagation queue
+# (`WatchpointRegistry._pending_propagation.queue`). Each CALL event
+# queues one entry that's consumed by the matching PY_START; the cap
+# protects against pathological CALL-without-PY_START sequences (e.g.,
+# rare arg-binding failures, C extensions intercepting Python calls).
+_MAX_PROPAGATION_QUEUE_SIZE = 1024
+
+# Max hops a frame-chain walker (`_find_user_caller`, `_find_user_code_caller`,
+# the `_pause_via_pydevd` disarm loop) will traverse before giving up.
+# A degenerate `f_back` chain that loops or grows beyond Python's
+# recursion limit is a sign of something gone wrong, not a normal stack.
+_MAX_FRAME_WALK_HOPS = 1024
+
+
+# Filename markers identifying our own runtime frames. When the runtime
+# is exec'd by sitecustomize (production path) every frame here has
+# co_filename = "<string>". When loaded via normal import (test path)
+# the filename is this file's absolute path; captured at module load.
+# `_find_user_caller` walks past frames matching either to find the
+# real caller, so a hit's source line is the user's mutation, not our
+# `super().__setattr__` line inside `_WatchedAnyAttrSubclass`.
+_RUNTIME_FILENAMES = frozenset(
+    f for f in ("<string>", globals().get("__file__")) if f
+)
+
+
+def _find_user_caller(start_frame: Any) -> Any:
+    """Walk `f_back` from `start_frame` until co_filename leaves the
+    runtime, or until we run out of frames / hit the safety limit.
+
+    Returns the first user-code frame, or None if every frame in the
+    chain is the watchpoint runtime (which would mean a watcher fired
+    inside our own instrumentation – callers should drop the hit).
+    """
+    f = start_frame
+    safety = _MAX_FRAME_WALK_HOPS
+    while f is not None and safety > 0:
+        if f.f_code.co_filename not in _RUNTIME_FILENAMES:
+            return f
+        f = f.f_back
+        safety -= 1
+    return None
+
+
+_STDLIB_DIR: Optional[str] = None
+try:
+    # `os.__file__` is `<base_prefix>/lib/pythonX.Y/os.py`; the directory
+    # is the stdlib install location. Computed once at module load so
+    # `_is_library_filename` stays O(1). Wrapped in try/except because
+    # `__file__` can be missing in exotic embedded interpreters.
+    import os as _os_for_stdlib_dir
+    _STDLIB_DIR = _os_for_stdlib_dir.path.dirname(
+        _os_for_stdlib_dir.path.abspath(_os_for_stdlib_dir.__file__)
+    )
+    _STDLIB_DIR_PREFIX = _STDLIB_DIR + _os_for_stdlib_dir.sep
+    del _os_for_stdlib_dir
+except Exception:
+    _STDLIB_DIR_PREFIX = None  # type: ignore
+
+
+# Module-load fingerprint: incremented every time we cut a new version
+# of the runtime. Logged on import via `_log_warn` so when a user reports
+# a bug we can confirm from /tmp/pythonwatchpoint.log which version of
+# the runtime is actually loaded in their session – distinguishing
+# "my fix didn't help" from "you're running an older bundled copy."
+_RUNTIME_VERSION = "2026-05-31-reject-backward-bp-line-v21"
+
+
+def _is_library_filename(path: str) -> bool:
+    """True if `path` lives under a Python install (stdlib or
+    site-packages / dist-packages).
+
+    Cheap substring + prefix check. Targets the cases where pydevd's
+    "do not step into library code" filter swallows a `CMD_STEP_OVER`:
+
+    - **site-packages / dist-packages**: third-party libraries
+      (Django, SQLAlchemy, pandas, ...). Substring match because the
+      path varies wildly across virtualenvs / system installs / uv /
+      poetry / etc.
+    - **Stdlib**: under the directory of `os.__file__`. The
+      user-reported `copy.deepcopy(qs)` case proved this: the mutation
+      site was inside Django (`query.py:289`, site-packages), but the
+      next user-code-looking frame walking up was `copy.py:143` –
+      Python stdlib, NOT site-packages. Without the stdlib filter we
+      anchored the pause on `copy.py:143`, which pydevd's library
+      filter then swallowed, and the debugger silently never stopped.
+
+    Why the previous "don't filter stdlib" stance was wrong: the
+    argument was "user code passing through stdlib helpers is still
+    user code". True in the abstract, but irrelevant for pause-anchor
+    purposes: pydevd's filter treats stdlib the same as
+    site-packages, so anchoring there is equally broken. The user's
+    OWN code – outside any Python install root – is the only place
+    pydevd will actually pause for us.
+    """
+    try:
+        import os as _os_for_user_roots
+        user_roots = _os_for_user_roots.environ.get(
+            "PYCHARM_WATCHPOINT_USER_ROOTS", ""
+        )
+        for root in user_roots.split(_os_for_user_roots.pathsep):
+            if not root:
+                continue
+            norm_root = _os_for_user_roots.path.abspath(root)
+            norm_path = _os_for_user_roots.path.abspath(path)
+            if norm_path == norm_root or norm_path.startswith(
+                norm_root + _os_for_user_roots.sep
+            ):
+                return False
+    except Exception:
+        pass
+    if "site-packages" in path or "dist-packages" in path:
+        return True
+    if _STDLIB_DIR_PREFIX is not None and path.startswith(_STDLIB_DIR_PREFIX):
+        return True
+    return False
+
+
+def _find_user_code_caller(start_frame: Any) -> Any:
+    """Walk `f_back` past runtime AND third-party library frames to
+    find the nearest user-code frame.
+
+    Different from `_find_user_caller`, which only skips OUR runtime
+    (`<string>` / this file). This one ALSO skips site-packages /
+    dist-packages frames, so the result is the user's own code – the
+    place the user can actually navigate to and reason about.
+
+    Why this exists: pydevd's `CMD_STEP_OVER + step_stop = library_frame`
+    is silently filtered out by PyCharm's "do not step into library
+    code" setting (and most users have it on). When the watched
+    mutation happens inside Django's `QuerySet._clone()` or
+    SQLAlchemy's session flush, anchoring the pause on that library
+    frame means pydevd's tracer skips the step-over entirely and the
+    cascade via PY_RETURN dies in further library frames before
+    reaching user code. Result: the watchpoint hit fires, the IDE
+    highlights the mutation site, but the debugger never actually
+    pauses.
+
+    Anchoring on user code in the first place avoids the filter-vs-
+    step-over interaction entirely: the pause lands at the user's
+    code that called into the library, which is what the user
+    actually wants ("I called .all() on line 956 of my code; that
+    triggered Django to do an internal mutation; show me the line in
+    MY code where I did that").
+
+    Returns the first non-runtime, non-library frame, or None if the
+    entire chain is runtime / library. None means "no user code to
+    anchor on – drop the hit": there's nowhere meaningful to pause,
+    and showing a highlight without a corresponding pause is worse
+    UX than silence.
+    """
+    f = start_frame
+    safety = _MAX_FRAME_WALK_HOPS
+    while f is not None and safety > 0:
+        path = f.f_code.co_filename
+        if path not in _RUNTIME_FILENAMES and not _is_library_filename(path):
+            # Path checks catch site-packages / stdlib. Also reject frames
+            # from known debugger/framework module roots installed OUTSIDE
+            # site-packages – e.g. PyCharm's bundled pydevd lives in a
+            # Gradle cache path like
+            #   .../pycharm-community-2025.1.../helpers/pydev/
+            # which contains no "site-packages" segment and is not under
+            # the stdlib prefix, so `_is_library_filename` passes it
+            # through. Checking the frame's __name__ root against
+            # _FRAMEWORK_MODULE_ROOTS catches these regardless of where
+            # the debugger is physically installed.
+            mod_root = (f.f_globals.get("__name__", "") or "").partition(".")[0]
+            if mod_root not in _FRAMEWORK_MODULE_ROOTS:
+                return f
+        f = f.f_back
+        safety -= 1
+    return None
+
+
 # ---------------------------------------------------------------------------
 # pydevd integration (graceful no-op when pydevd isn't loaded)
 # ---------------------------------------------------------------------------
@@ -2169,100 +3185,36 @@ def _get_pydevd_debugger() -> Any:
     return None
 
 
-def _detect_debugger() -> str:
-    """Identify the live debugger backend driving this interpreter.
-
-    Returns one of:
-        'pydevd'  – PyCharm's native debugger; `_pause_via_pydevd` is usable.
-        'debugpy' – Microsoft's debugger (PyCharm 2025+ beta mode, VS Code).
-                    `_pause_via_pydevd` is NOT usable; use the debugpy backend.
-        'none'    – no debugger detected (plain `python script.py`, pytest, etc.).
-                    `_handle_hit` falls back to raising WatchpointHit.
-
-    Order matters: debugpy bundles its own copy of pydevd internally, so we
-    check for the top-level `debugpy` module first. Only if it's absent do we
-    treat a present `pydevd` as the canonical pydevd backend.
-    """
-    if "debugpy" in sys.modules:
-        return "debugpy"
-    if _get_pydevd_debugger() is not None:
-        return "pydevd"
-    return "none"
-
-
 def _pycharm_watchpoint_diag() -> str:
     """Return a short diagnostic the user can evaluate from the debugger."""
     import sys as _sys
     in_mod = "pydevd" in _sys.modules
     bundle_in_mod = "_pydevd_bundle.pydevd_constants" in _sys.modules
-    debugpy_in_mod = "debugpy" in _sys.modules
     tr = _sys.gettrace()
     tr_owner = type(getattr(tr, "__self__", None)).__name__ if tr is not None else "None"
     debugger = _get_pydevd_debugger()
     return (
-        f"backend: {_detect_debugger()}; "
         f"pydevd in sys.modules: {in_mod}; "
         f"_pydevd_bundle.pydevd_constants in sys.modules: {bundle_in_mod}; "
-        f"debugpy in sys.modules: {debugpy_in_mod}; "
         f"sys.gettrace owner: {tr_owner}; "
         f"get_global_debugger -> {type(debugger).__name__ if debugger else 'None'}; "
         f"last_error: {_pydevd_last_error}"
     )
 
 
-def _pycharm_log_state() -> str:
-    """Print the runtime state to stderr (visible in the Debug Console) and
-    return a short confirmation.
-
-    Why this exists: under debugpy, `XValue.toString()` on the IDE side returns
-    empty for many DAP-evaluated expressions, so a caller that just evaluates
-    `_pycharm_watchpoint_state()` and tries to read the result string gets
-    nothing back. Printing to stderr instead routes the diagnostic into the
-    Debug Console where the user can actually see it, and works identically
-    across pydevd / debugpy / no-debugger.
-    """
-    msg = _pycharm_watchpoint_state()
-    try:
-        print(f"[WATCHPOINT/probe] {msg}", file=sys.stderr, flush=True)
-    except Exception:  # noqa: BLE001
-        pass
-    return "OK"
-
-
-def _pycharm_watchpoint_state() -> str:
-    """Full state dump for diagnosing why a watch did/didn't fire.
-
-    Returns everything we'd want to know on a "nothing happens" bug report:
-    detected debugger, claimed sys.monitoring tool ID, which tools own the
-    other IDs, current watch registry contents, and the standard pydevd diag.
-    Designed to be safe to call from the IDE evaluator while paused under
-    any debugger backend; never raises.
-    """
-    try:
-        tools = []
-        for i in range(6):
-            try:
-                tools.append((i, sys.monitoring.get_tool(i)))
-            except Exception as e:  # noqa: BLE001
-                tools.append((i, f"<err:{e!r}>"))
-        local_keys = list(_registry._local_watches.keys())
-        attr_keys = list(_registry._attr_watches.keys())
-        return (
-            f"backend: {_detect_debugger()}; "
-            f"tool_id: {_TOOL_ID}; "
-            f"tools: {tools}; "
-            f"local_watches: {local_keys}; "
-            f"attr_watches: {attr_keys}; "
-            f"diag: {_pycharm_watchpoint_diag()}"
-        )
-    except Exception as e:  # noqa: BLE001
-        return f"_pycharm_watchpoint_state ERROR: {e!r}"
-
-
 def _pause_via_pydevd(py_db: Any, user_frame: Any, watch_name: str,
                       old_repr: str, new_repr: str,
-                      source_file: str, source_line: int) -> None:
+                      source_file: str, source_line: int) -> bool:
     """Hand off to pydevd's own tracer to pause cleanly at the next user line.
+
+    Returns True if the pause was ACTUALLY armed (state set, f_trace
+    assigned, PEP 669 events enabled), or False if a silent early-return
+    path fired (`_finish_debugging_session`, `is_tracing`). The caller
+    uses this signal to decide whether to engage the dedupe gate –
+    setting the gate on a `False` return locks out all subsequent hits
+    in the same micro-batch even though the IDE never paused for the
+    first one, which manifests as "watchpoint hit fires + highlight
+    renders, but the debugger never actually stops."
 
     We deliberately do NOT call `py_db.do_wait_suspend(...)` here. Going through
     do_wait_suspend would mean pydevd's send-suspend-message work (XML build +
@@ -2305,16 +3257,15 @@ def _pause_via_pydevd(py_db: Any, user_frame: Any, watch_name: str,
     import threading
     from _pydevd_bundle.pydevd_comm_constants import CMD_STEP_OVER
     from _pydevd_bundle.pydevd_constants import STATE_RUN, PYTHON_SUSPEND
-    # `set_additional_thread_info` is re-exported by PyCharm's pydevd through
-    # `pydevd_trace_dispatch`, but debugpy's vendored pydevd does NOT re-export
-    # it there – we hit `ImportError: cannot import name 'set_additional_thread_info'`
-    # on the very first watchpoint hit under debugpy. The function itself exists
-    # in both flavors at this canonical location, so import it directly.
-    from _pydevd_bundle.pydevd_additional_thread_info import set_additional_thread_info
+    from _pydevd_bundle.pydevd_trace_dispatch import set_additional_thread_info
 
     if getattr(py_db, "_finish_debugging_session", False):
         # Debugger is shutting down – don't try to suspend.
-        return
+        _log_warn(
+            f"_pause_via_pydevd: EARLY RETURN (_finish_debugging_session=True) "
+            f"for '{watch_name}'; pause NOT armed"
+        )
+        return False
 
     thread = threading.current_thread()
     info = set_additional_thread_info(thread)
@@ -2322,7 +3273,13 @@ def _pause_via_pydevd(py_db: Any, user_frame: Any, watch_name: str,
     # Reentrancy guard – pydevd's own tracer may already be mid-callback on
     # this thread; let it finish before we try to overlay our suspend.
     if getattr(info, "is_tracing", False):
-        return
+        _log_warn(
+            f"_pause_via_pydevd: EARLY RETURN (info.is_tracing=True) "
+            f"for '{watch_name}'; pause NOT armed. "
+            f"This means pydevd's tracer is mid-callback on this thread – "
+            f"our overlay would race with it."
+        )
+        return False
 
     # Emit a one-line hit notification on stderr (debug console) so the user
     # can see which watch fired and where, since we no longer set pydevd's
@@ -2353,7 +3310,7 @@ def _pause_via_pydevd(py_db: Any, user_frame: Any, watch_name: str,
     # CALL events – clearing makes their unwind events fire NO tracing at
     # all, which is strictly safer.
     own_frame = sys._getframe(0)
-    safety_limit = 32  # bound against degenerate f_back chains
+    safety_limit = _MAX_FRAME_WALK_HOPS  # bound against degenerate f_back chains
     while own_frame is not None and own_frame is not user_frame and safety_limit > 0:
         try:
             own_frame.f_trace = None
@@ -2365,15 +3322,26 @@ def _pause_via_pydevd(py_db: Any, user_frame: Any, watch_name: str,
         own_frame = own_frame.f_back
         safety_limit -= 1
 
-    # Arm pydevd's full `trace_dispatch` on user_frame. Pydevd's CALL handler
-    # often parks user_frame's `f_trace` at `trace_exception` (a fast-path
-    # that only handles exception events – no step_cmd check) when the frame
-    # has no in-line breakpoints. For our CMD_STEP_OVER hint above to fire,
-    # user_frame's `f_trace` must be the FULL `trace_dispatch`. We set it
-    # directly first (the most reliable mechanism), then call the official
-    # API which handles the parent chain. `set_trace_for_frame_and_parents`
-    # has several silent early-return paths (PEP 669 mode, filtered files,
-    # etc.) so we can't rely on it alone to update user_frame's f_trace.
+    # Arm pydevd's tracer on user_frame and its callers so the next line
+    # event in any of them flips into pydevd's pause flow.
+    #
+    # CRITICAL: we set `user_frame.f_trace` DIRECTLY first, then call the
+    # official API. Pydevd's CALL handler often parks user_frame's f_trace
+    # at `trace_exception` (a fast-path that only handles exception
+    # events, no suspend check) when the frame has no breakpoints and no
+    # active step command at the moment of CALL. After `set_suspend`
+    # flipped state to STATE_SUSPEND, we need user_frame's NEXT line
+    # event to fire pydevd's FULL `trace_dispatch` (the one that pauses
+    # on suspend). `set_trace_for_frame_and_parents` is supposed to do
+    # this, but it has multiple early-return paths (PEP 669 monitoring
+    # mode, filtered files, etc.) where it silently does nothing –
+    # leaving user_frame.f_trace at `trace_exception`. Then the LINE
+    # event fires trace_exception (no pause), the print on the next
+    # user line runs, and the pause finally latches deep inside print's
+    # internal codecs/IO chain (`<encodings.utf_8.IncrementalDecoder>`-
+    # adjacent frames) – the IDE shows that frame as topmost
+    # `<frame not available>` with the user's actual frame one level
+    # down. Setting f_trace directly bypasses the API's early returns.
     trace_dispatch_fn = getattr(py_db, "trace_dispatch", None)
     if trace_dispatch_fn is not None:
         try:
@@ -2387,6 +3355,590 @@ def _pause_via_pydevd(py_db: Any, user_frame: Any, watch_name: str,
             set_trace_for_parents(user_frame)
         except Exception:  # noqa: BLE001
             pass
+
+    # PEP 669 supplement (Python 3.12+). `set_trace_for_frame_and_parents`
+    # was designed for the sys.settrace world; under sys.monitoring it is
+    # mostly a no-op on frames pydevd hasn't already armed. Result: a hit
+    # whose user_frame belongs to a function pydevd hasn't entered with an
+    # active step command (e.g. a fast helper like
+    # `charge_card`/`ship_to_customer` that we step INTO during run mode)
+    # never gets LINE / PY_RETURN events delivered to pydevd's PEP 669
+    # callbacks, so our `CMD_STEP_OVER + step_stop = user_frame` never fires
+    # a pause. The subsequent hit overwrites step_stop and the pause
+    # materialises only for the LAST hit – we observed this as "stops 2
+    # times for 3 mutations" in test_demo_b.
+    #
+    # We force event delivery to pydevd's tool (DEBUGGER_ID = 0) on the
+    # relevant code objects ourselves. Two code objects matter:
+    #
+    # 1. `user_frame.f_code` – needs both LINE (for "next line in this
+    #    function" stepping) AND PY_RETURN (for "function returned without
+    #    another LINE", which is the EXACT failure mode in test_demo_b:
+    #    `order.status = "paid"` is the last statement of `charge_card`, so
+    #    no further LINE event ever fires – pydevd has to learn about the
+    #    return through PY_RETURN to recognize the step-over as completed).
+    #
+    # 2. `user_frame.f_back.f_code` – the caller's code. After PY_RETURN
+    #    completes pydevd's step-over, the pause needs to land on the
+    #    caller's NEXT line event. Without LINE enabled there for
+    #    DEBUGGER_ID, pydevd's tracer never gets called when the caller
+    #    resumes after `charge_card()` returns, and the pause is silently
+    #    dropped. PY_RETURN on the caller is included for symmetry – if the
+    #    caller is ALSO returning (e.g. our hit fires from the last line
+    #    of a one-liner caller), pydevd still sees the unwind.
+    #
+    # `set_local_events` is per-code-object and overwrites the previous
+    # event mask, so we OR with the current events to avoid stomping on
+    # whatever pydevd already has registered there.
+    supplement_status = "skipped"
+    try:
+        debugger_tool_id = sys.monitoring.DEBUGGER_ID  # 0 per PEP 669
+        wanted = (
+            sys.monitoring.events.LINE
+            | sys.monitoring.events.PY_RETURN
+        )
+        existing = sys.monitoring.get_local_events(debugger_tool_id, user_frame.f_code)
+        sys.monitoring.set_local_events(
+            debugger_tool_id, user_frame.f_code, existing | wanted,
+        )
+        # Caller's f_code too – the natural pause landing site once
+        # user_frame returns. Skip silently if there is no caller (only
+        # happens for the program's top frame, which a watchpoint cannot
+        # realistically fire from since there's no `__setattr__` chain
+        # reaching root – but the guard costs nothing).
+        f_back = user_frame.f_back
+        if f_back is not None:
+            existing_back = sys.monitoring.get_local_events(
+                debugger_tool_id, f_back.f_code,
+            )
+            sys.monitoring.set_local_events(
+                debugger_tool_id, f_back.f_code, existing_back | wanted,
+            )
+        supplement_status = "applied"
+    except Exception as e:  # noqa: BLE001
+        # Safe to ignore: if pydevd isn't using its DEBUGGER_ID tool slot
+        # (older Python, sys.settrace mode, etc.), the regular trace_dispatch
+        # mechanism above handles the pause and we don't need this supplement.
+        supplement_status = f"failed ({e!r})"
+
+    _log_warn(
+        f"_pause_via_pydevd: pause ARMED for '{watch_name}' at "
+        f"{user_frame.f_code.co_filename}:{user_frame.f_lineno} "
+        f"(step_stop set, f_trace={'set' if trace_dispatch_fn else 'unavailable'}, "
+        f"PEP669_supplement={supplement_status}). "
+        f"Now waiting for pydevd's tracer to fire a LINE/PY_RETURN event "
+        f"on this code object."
+    )
+    return True
+
+
+def _get_except_handler_lines(code: Any) -> set:
+    """Get line numbers that are ONLY reachable via exception handlers.
+
+    These lines are unreachable by normal sequential flow – installing a bp
+    there means it will never fire in the normal (no-exception) path. This
+    is the root cause of the out-of-order watchpoint hits bug: a mutation
+    on the last line of a try body installs a bp at the next code line
+    (the except handler), which never fires; the safety-net bp at a distant
+    caller fires much later giving confusing ordering.
+
+    Important: lines that appear in BOTH handler regions AND normal-flow
+    regions (e.g. inlined finally bodies) are NOT excluded – they ARE
+    reachable in normal flow.
+
+    Uses `dis._parse_exception_table` (private but stable since 3.12).
+    Returns an empty set on failure (graceful degradation to old behavior).
+    """
+    try:
+        import dis
+
+        # Collect all (start_offset, end_offset, line) triples from co_lines.
+        line_entries = [
+            (start, end, line)
+            for (start, end, line) in code.co_lines()
+            if line is not None
+        ]
+        if not line_entries:
+            return set()
+
+        # Build handler regions: the bytecode range [target, ...) for each
+        # depth=0 handler. We approximate the handler's end as the next
+        # handler's start or the code's end.
+        handler_targets = sorted(set(
+            entry.target
+            for entry in dis._parse_exception_table(code)
+            if entry.depth == 0
+        ))
+        if not handler_targets:
+            return set()
+
+        # For each line, determine if ALL its bytecode is within handler
+        # regions. A line with bytecode both inside and outside a handler
+        # region (e.g. inlined finally body) should NOT be excluded.
+        # Strategy: a line entry at offset X is "in a handler" if X >= some
+        # handler target AND X < the next non-handler code after that target.
+        # Simplified: just check if the line entry's start offset is >= any
+        # handler target. Since handlers are contiguous blocks at the end of
+        # the code object (CPython's layout), any offset >= a handler_target
+        # that's before the next try body is in a handler.
+
+        # Simpler approach: find handler entry lines (first line at each
+        # handler target) and lines exclusively within handler ranges.
+        # For correctness with finally inlining, only mark lines where
+        # EVERY occurrence in co_lines is within a handler region.
+        handler_only_lines: set = set()
+        normal_flow_lines: set = set()
+
+        # Determine which offsets are in handler regions.
+        # Handler region starts at the target; for simplicity we consider
+        # any offset >= target that's before the next non-handler entry
+        # point to be "in a handler". CPython lays out handlers after the
+        # try body's jump, so an offset is in a handler if it's >= any
+        # handler_target and there's no lower handler_target between it.
+        handler_target_set = set(handler_targets)
+
+        # Build the set of "handler region" offsets. An instruction at
+        # offset X is in a handler if X >= some handler target. The try
+        # body is always at lower offsets. This heuristic works because
+        # CPython always emits try bodies before their handlers.
+        min_handler_offset = min(handler_targets)
+
+        for (start, end, line) in line_entries:
+            if start >= min_handler_offset:
+                handler_only_lines.add(line)
+            else:
+                normal_flow_lines.add(line)
+
+        # Lines in both sets are reachable in normal flow – exclude them.
+        return handler_only_lines - normal_flow_lines
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+def _next_code_line_in(code: Any, after_line: int) -> Optional[int]:
+    """Find the smallest line number in `code` that's strictly > `after_line`
+    AND reachable by normal sequential flow (not an exception handler entry).
+
+    Uses `code.co_lines()` (Python 3.10+) which iterates the line table.
+    Only ACTUAL code lines are returned – blank lines, lines between
+    statements, and lines past the function's last statement are not in
+    the table and won't be returned.
+
+    Exception handler lines (the `except ...:` clause, `finally:` handler
+    entry, etc.) are excluded because they're unreachable in normal flow.
+    When a mutation happens on the last line of a try body, the numerically
+    next code line is the except handler – installing a bp there means it
+    never fires in the normal path. Skipping those lines lets us find the
+    first line AFTER the try/except block, which IS reachable.
+
+    Falls back to including handler lines if no non-handler candidate
+    exists (better than returning None and forcing a do_wait_suspend
+    fallback).
+
+    Why this matters: pydevd `LineBreakpoint` fires only when a LINE event
+    is emitted for the breakpoint's line. LINE events only fire for actual
+    code lines. If we install a bp at `f_lineno + 1` and that line is
+    blank (e.g., the function ends right after the watched mutation),
+    the bp sits there inert and the pause never materialises – the
+    user-reported `set_accessible_products` case exactly: line 195 is the
+    function's last statement, line 196 is blank, bp at 196 never fires.
+
+    Returns the smallest valid code line > `after_line`, or None if no
+    such line exists in this code object (in which case the caller should
+    walk up to f_back and try there).
+    """
+    try:
+        # co_lines yields (start_offset, end_offset, lineno) tuples;
+        # `lineno` can be None for synthetic instructions, which we skip.
+        all_lines = [
+            ln for (_, _, ln) in code.co_lines()
+            if ln is not None and ln > after_line
+        ]
+        if not all_lines:
+            return None
+
+        # Exclude exception handler entry lines – they're unreachable in
+        # normal (no-exception) flow and installing a bp there means it
+        # silently never fires.
+        handler_lines = _get_except_handler_lines(code)
+        if handler_lines:
+            non_handler = [ln for ln in all_lines if ln not in handler_lines]
+            if non_handler:
+                return min(non_handler)
+            # All candidates are handler lines – fall back to the closest
+            # one (better than None which triggers do_wait_suspend).
+
+        return min(all_lines)
+    except Exception:  # noqa: BLE001
+        # `co_lines` exists on all 3.12/3.13/3.14, but some exotic
+        # code objects (e.g., compiled by alternative frontends) might
+        # not implement it. Returning None falls back gracefully.
+        return None
+
+
+def _next_code_line_after_frame(frame: Any) -> Optional[int]:
+    """Find the next LINE event after the frame's current bytecode offset.
+
+    Source-line order and execution order differ for multi-line statements.
+    The openapi.py failure is exactly this shape: STORE_ATTR reports line 105,
+    but the RHS continuation lines 106-112 have already executed. Looking at
+    `f_lasti` lets us pick the next executable line in the future.
+
+    Exception-handler-only lines are intentionally skipped. If a mutation is
+    the last normal statement in a try body, bytecode order points at the
+    except handler next, but that line is unreachable on the no-exception path
+    and a breakpoint there would sit inert until a distant safety net fires.
+
+    Backward-pointing lines are also rejected. CPython's RETURN_CONST at the
+    end of a function can be tagged with an earlier source line (e.g. the
+    closing bracket of a multi-line expression). If the mutation is on the
+    function's last statement, the next bytecode instruction may point at a
+    line BEFORE the current one – that line has already executed and a bp
+    there will never fire. Requiring `line > current_line` catches this edge
+    case and lets the caller fall through to the f_back walk.
+    """
+    lasti = getattr(frame, "f_lasti", None)
+    if lasti is None:
+        return None
+    try:
+        import dis
+        current_line = getattr(frame, "f_lineno", None)
+        handler_lines = _get_except_handler_lines(frame.f_code)
+        for inst in dis.get_instructions(frame.f_code):
+            if inst.offset <= lasti:
+                continue
+            line = _instruction_starts_line(inst)
+            if (line is not None
+                    and line != current_line
+                    and (current_line is None or line > current_line)
+                    and line not in handler_lines):
+                return line
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def _instruction_starts_line(inst: Any) -> Optional[int]:
+    """Return the source line if `inst` starts a new line event.
+
+    Python 3.14 changed `dis.Instruction.starts_line` to a bool and moved
+    the actual line number to `line_number`; 3.12/3.13 store the integer
+    directly in `starts_line`.
+    """
+    starts_line = getattr(inst, "starts_line", None)
+    if isinstance(starts_line, int) and not isinstance(starts_line, bool):
+        return starts_line
+    if starts_line:
+        line_number = getattr(inst, "line_number", None)
+        if isinstance(line_number, int):
+            return line_number
+    return None
+
+
+def _install_bp_at(py_db: Any, target_code: Any, file: str, line: int,
+                   watch_name: str) -> Optional[Tuple[str, int, int]]:
+    """Install a single temporary pydevd `LineBreakpoint` at (file, line).
+
+    `target_code` is the code object that owns `line`. We need it to call
+    `sys.monitoring.set_local_events(DEBUGGER_ID, target_code, ...)` so
+    pydevd's `py_line_callback` fires for the bp regardless of pydevd's
+    per-function "should-trace" decision made at the function's first
+    entry (design contract §13).
+
+    Returns `(file, line, bp_id)` on success – caller appends to
+    `WatchpointRegistry._temp_breakpoints` for later cleanup. Returns None
+    if install failed (LineBreakpoint import error, debugger shutting down,
+    `consolidate_breakpoints` raised, etc.) – caller decides whether to
+    fall back to `_pause_via_do_wait_suspend` or drop the hit silently.
+
+    Why `LineBreakpoint` + `consolidate_breakpoints`: it is the same path
+    that user-set breakpoints go through – the most heavily exercised
+    code path in pydevd. Pydevd's `consolidate_breakpoints` calls
+    `clear_skip_caches` which under PEP 669 calls `restart_events()`,
+    re-firing PY_START for currently-executing code so pydevd's
+    per-function setup logic re-runs and correctly enables LINE tracing
+    now that the file has a breakpoint.
+
+    Caller is responsible for selecting (file, line, target_code) – the
+    sequential-bps logic in `WatchpointRegistry._compute_bp_target` walks
+    the anchor frame's code lines to find the next unused slot, so this
+    helper does not do candidate selection itself anymore.
+    """
+    try:
+        from _pydevd_bundle.pydevd_breakpoints import LineBreakpoint
+    except Exception as e:  # noqa: BLE001
+        _log_warn(
+            f"_install_bp_at: LineBreakpoint import failed ({e!r}); "
+            f"pause cannot be armed via breakpoint."
+        )
+        return None
+
+    if getattr(py_db, "_finish_debugging_session", False):
+        _log_warn(
+            f"_install_bp_at: debugger is shutting down; "
+            f"skipping bp install for '{watch_name}'."
+        )
+        return None
+
+    try:
+        # Pydevd internally uses the "real path" (post-`os.path.realpath` +
+        # case-normalization on Windows) as the key for both
+        # `py_db.breakpoints` AND `_FILENAME_TO_IN_SCOPE_CACHE`. Its
+        # `py_line_callback` looks up `py_db.breakpoints[real_path]`. If
+        # we registered our bp under `co_filename` (which can differ –
+        # e.g. macOS `/var` vs `/private/var`, symlink-collapsed paths,
+        # case differences on Windows), the lookup misses and the bp
+        # silently never fires. Always normalize via pydevd's own
+        # function so our keys match what pydevd computes from the
+        # live frame.
+        try:
+            from pydevd_file_utils import (
+                get_abs_path_real_path_and_base_from_file,
+            )
+            abs_path, real_path, _base = get_abs_path_real_path_and_base_from_file(file)
+        except Exception:  # noqa: BLE001
+            abs_path = file
+            real_path = file
+
+        # Negative bp_id so we never collide with pydevd's positive,
+        # IDE-assigned IDs. Hash the (watch_name, file, line) tuple
+        # for some semblance of uniqueness across concurrent watches.
+        bp_id = -((hash((watch_name, real_path, line)) & 0x7FFFFFFF) + 1)
+
+        # `func_name` matters when the bp is in a library file. Pydevd's
+        # `_should_enable_line_events_for_code` (in
+        # `_pydevd_bundle/pydevd_pep_669_tracing.py`) iterates the file's
+        # bps and decides whether to enable LINE tracing for the CURRENT
+        # frame's code object by matching `bp.func_name` against
+        # `curr_func_name`. A bp with `func_name=""` never matches – so
+        # for library files where pydevd's PY_START callback would
+        # otherwise short-circuit, LINE tracing stays disabled and our
+        # bp never fires. Setting `func_name` to the target function's
+        # actual name (`target_code.co_name`) makes the match succeed.
+        bp = LineBreakpoint(
+            line,
+            condition=None,
+            func_name=target_code.co_name,
+            expression=None,
+            suspend_policy="NONE",
+        )
+
+        # Pre-mark the file as "in project scope" so pydevd's PY_START
+        # callback doesn't return DISABLE on first entry (it does so for
+        # LIB_FILE files whose `in_project_scope()` returns False – which
+        # includes everything under site-packages by default). Without
+        # this, pydevd never reaches `_should_enable_line_events_for_code`
+        # for library files, and LINE tracing for our target_code stays
+        # disabled. We mark BOTH `abs_path` and `real_path` because the
+        # cache is keyed by whichever pydevd happens to look up.
+        try:
+            from _pydevd_bundle.pydevd_utils import _FILENAME_TO_IN_SCOPE_CACHE
+            _FILENAME_TO_IN_SCOPE_CACHE[real_path] = True
+            _FILENAME_TO_IN_SCOPE_CACHE[abs_path] = True
+            _FILENAME_TO_IN_SCOPE_CACHE[file] = True
+        except Exception as e:  # noqa: BLE001
+            _log_warn(
+                f"_install_bp_at: could not mark {file} as in-project ({e!r}); "
+                f"bp may not fire if pydevd's library filter rejects it."
+            )
+
+        id_to_bp = py_db.file_to_id_to_line_breakpoint.setdefault(real_path, {})
+        id_to_bp[bp_id] = bp
+
+        # `consolidate_breakpoints` does the standard pydevd setup:
+        # - Builds line→bp map in py_db.breakpoints[real_path]
+        # - Clears global_cache_skips / global_cache_frame_skips
+        # - In PEP 669 mode, calls `restart_events()`.
+        py_db.consolidate_breakpoints(real_path, id_to_bp, py_db.breakpoints)
+
+        # CRITICAL: also force LINE+PY_RETURN events armed for the
+        # target code object directly. Without this, the bp WON'T
+        # fire for the function that's currently mid-execution.
+        # Why: pydevd's PY_START callback decides LINE tracing per
+        # code object on first entry. For files with no breakpoints
+        # at that moment, it decides "no LINE tracing needed" and
+        # never arms LINE for the code object. `restart_events`
+        # re-fires already-armed events but doesn't fabricate a
+        # fresh PY_START to re-evaluate – so the current invocation
+        # of e.g. `_get_relation` retains its "no LINE" decision
+        # from BEFORE we added the breakpoint, and our bp at
+        # features_calculation.py:594 never gets checked.
+        #
+        # `set_local_events` overrides that decision at the C level,
+        # making LINE+PY_RETURN fire for `target_code` regardless of
+        # what pydevd's per-function setup decided. Pydevd's
+        # py_line_callback then sees the bp via the breakpoints dict
+        # and pauses. PY_RETURN is included for symmetry – covers
+        # cases where target_code's bp-line is unreachable in this
+        # invocation and the function returns first.
+        try:
+            debugger_tool_id = sys.monitoring.DEBUGGER_ID
+            wanted = (
+                sys.monitoring.events.LINE
+                | sys.monitoring.events.PY_RETURN
+            )
+            existing = sys.monitoring.get_local_events(
+                debugger_tool_id, target_code,
+            )
+            sys.monitoring.set_local_events(
+                debugger_tool_id, target_code, existing | wanted,
+            )
+            # CRITICAL: restart_events() MUST be called AFTER
+            # set_local_events. Per CPython docs, restart_events()
+            # "triggers events to be generated immediately for the
+            # currently running code." Without this, set_local_events
+            # on a code object that's MID-EXECUTION may not take
+            # effect for the current frame – the instrumentation
+            # points in the bytecode aren't updated until the next
+            # function entry. This is the root cause of the csp
+            # mystery: _make_nonce's bp at line 28 installed and
+            # local_events was set, but LINE never fired because
+            # CPython's eval loop hadn't re-instrumented the active
+            # frame's bytecode. restart_events() forces that
+            # re-instrumentation immediately.
+            sys.monitoring.restart_events()
+            arm_status = "armed"
+        except Exception as e:  # noqa: BLE001
+            # Tool ID not in use (sys.settrace mode, older pydevd).
+            # The regular bp install above still works for future
+            # invocations; only mid-execution is the concern.
+            arm_status = f"failed ({e!r})"
+
+        _log_warn(
+            f"_install_bp_at: bp installed at "
+            f"{real_path}:{line} (bp_id={bp_id}, target_code={target_code.co_name}, "
+            f"local_events={arm_status}, original_path={file}) for '{watch_name}'"
+        )
+
+        # DIRECT-PAUSE MECHANISM: arm LINE on OUR tool (_TOOL_ID) so our
+        # _on_line callback fires independently of pydevd's DEBUGGER_ID.
+        # This is the belt-and-suspenders fix for the csp mystery: even if
+        # pydevd's py_line_callback never fires (because its PY_START
+        # DISABLEd the code before our bp existed and set_local_events on
+        # DEBUGGER_ID doesn't reliably re-arm mid-execution), OUR callback
+        # WILL fire because _TOOL_ID has no prior DISABLE history for this
+        # code object. When our _on_line sees (code, line) in
+        # _bp_pause_pending, it triggers do_wait_suspend directly.
+        try:
+            if _TOOL_ID is not None:
+                tool_existing = sys.monitoring.get_local_events(
+                    _TOOL_ID, target_code,
+                )
+                sys.monitoring.set_local_events(
+                    _TOOL_ID, target_code,
+                    tool_existing | sys.monitoring.events.LINE,
+                )
+                # Register in the registry's pending dict so _on_line
+                # knows to trigger a pause for this (code, line).
+                _registry._bp_pause_pending[(id(target_code), line)] = True
+        except Exception as e:  # noqa: BLE001
+            _log_warn(
+                f"_install_bp_at: direct-pause arm on _TOOL_ID failed "
+                f"({e!r}); relying on pydevd's callback alone."
+            )
+
+        # Return `real_path` as the bp file key – `_remove_temp_breakpoints`
+        # uses it to look up `py_db.file_to_id_to_line_breakpoint[real_path]`.
+        # The caller's selective-drain match (hit's `bp_anchor_file`) also
+        # uses this, so the Kotlin side's pause location should match.
+        return (real_path, line, bp_id)
+    except Exception as e:  # noqa: BLE001
+        _log_warn(
+            f"_install_bp_at: failed to install at "
+            f"{file}:{line} ({e!r})"
+        )
+        return None
+
+
+def _pause_via_do_wait_suspend(py_db: Any, frame: Any,
+                               watch_name: str) -> bool:
+    """Last-resort pause: call `do_wait_suspend` directly on `frame`.
+
+    Used as a fallback when no valid next-code-line bp slot is available
+    via `WatchpointRegistry._compute_bp_target`. The user-reported scenario is the
+    `script.py` last-line case: watched local mutates on line 16, the
+    LINE-event for line 18 (the last code line in the module's body)
+    fires our callback to detect the change, and there's no next line
+    in the module to install a bp on. f_back is Python's runner /
+    pydevd's machinery (filtered as library), so the bp approach has
+    nowhere to land.
+
+    Trade-off (a.k.a. "the urllib trap" – see `_pause_via_pydevd`'s
+    rule-1 docstring): `do_wait_suspend` sends the IDE a "stopped"
+    message via pydevd's protocol layer, which encodes the protocol
+    XML using `urllib.parse.quote`. That puts `urllib/parse.py` on top
+    of the user thread's call stack at pause time. The IDE shows
+    `urllib/parse.py` as the topmost frame, our `<string>` runtime
+    below it, then the actual user frame at the bottom. The user has
+    to click their frame in the Debugger's Frames panel to see their
+    code.
+
+    Why we use this anyway: silent no-pause is worse than ugly-stack
+    pause for a deliberate `watch(...)` call. The user *asked* the
+    debugger to pause when the variable changes; honoring that with
+    a less-than-ideal stack is better than ignoring it.
+
+    Returns True if pause armed (do_wait_suspend invoked – it blocks
+    until user resumes, so on return either the pause completed
+    cleanly or the call failed before blocking). False on any setup
+    exception.
+    """
+    try:
+        import threading
+        from _pydevd_bundle.pydevd_comm_constants import CMD_SET_BREAK
+
+        if getattr(py_db, "_finish_debugging_session", False):
+            _log_warn(
+                f"_pause_via_do_wait_suspend: debugger shutting down, "
+                f"skipping fallback for '{watch_name}'"
+            )
+            return False
+
+        thread = threading.current_thread()
+        # CMD_SET_BREAK is what real breakpoints use for set_suspend –
+        # matches the watchpoint's "this is a break-like event" semantics
+        # better than CMD_THREAD_SUSPEND (which is the manual-pause
+        # button's command).
+        py_db.set_suspend(thread, CMD_SET_BREAK, suspend_other_threads=False)
+        # Blocks here until the user clicks Resume / Step. The IDE-side
+        # sessionPaused fires during this call (before the block), so
+        # the highlighter has a chance to drain the queue, install
+        # decorations, and clear the dedupe gate while we're paused.
+        py_db.do_wait_suspend(thread, frame, 'line', None)
+        return True
+    except Exception as e:  # noqa: BLE001
+        _log_warn(
+            f"_pause_via_do_wait_suspend: failed for '{watch_name}': {e!r}"
+        )
+        return False
+
+
+def _remove_temp_breakpoints(py_db: Any, installed: list) -> None:
+    """Remove the breakpoints installed by `_install_bp_at`.
+
+    Safe to call when py_db is None, when the breakpoints were never
+    installed, when pydevd is mid-shutdown, etc. Errors are logged but
+    never raised – a leaked bp is a minor annoyance; an exception out of
+    `_pycharm_consume_last_hit` could destabilize the IDE-side drain
+    flow.
+    """
+    if py_db is None or not installed:
+        return
+    for file, line, bp_id in installed:
+        try:
+            id_to_bp = py_db.file_to_id_to_line_breakpoint.get(file)
+            if id_to_bp is None:
+                continue
+            id_to_bp.pop(bp_id, None)
+            # Rebuild line→bp map so the user's bp (if any) at the same
+            # line gets restored. `consolidate_breakpoints` is what does
+            # this rebuilding.
+            py_db.consolidate_breakpoints(file, id_to_bp, py_db.breakpoints)
+        except Exception as e:  # noqa: BLE001
+            _log_warn(
+                f"_remove_temp_breakpoints: failed to remove bp at "
+                f"{file}:{line} (bp_id={bp_id}): {e!r}"
+            )
 
 
 def _value_hash(value: Any) -> int:
@@ -2491,9 +4043,14 @@ def watch(expr: str, *, frame: Any = None) -> None:
         expr:  Variable name or dotted attribute path to watch.
         frame: Explicit frame to resolve expr in. Defaults to caller's frame.
     """
+    global _installing_watch_thread
     if frame is None:
         frame = sys._getframe(1)
-    _registry.add_watch(expr, frame)
+    _installing_watch_thread = threading.get_ident()
+    try:
+        _registry.add_watch(expr, frame)
+    finally:
+        _installing_watch_thread = None
 
 
 def unwatch(expr: str) -> None:
@@ -2507,8 +4064,7 @@ def clear_watches() -> None:
 
 
 def _find_paused_user_frame(file_hint: str, func_hint: str) -> Any:
-    """Locate the paused user frame matching `file_hint` (and, if available,
-    `func_hint`).
+    """Locate the paused user frame matching `file_hint` + `func_hint`.
 
     Used by `watch_at` (PyCharm plugin entry point): when a watch is added
     via the IDE's "Add Python Watchpoint" action, the expression is evaluated
@@ -2517,15 +4073,6 @@ def _find_paused_user_frame(file_hint: str, func_hint: str) -> Any:
     pydevd, not into user code. We have to recover the user frame ourselves
     by scanning every running thread's top frame and walking up.
 
-    `func_hint` may be empty: under debugpy the IDE-side `AddWatchpointAction`
-    sometimes cannot extract the function name from a DAP stack frame, so it
-    passes "" and asks us to match by file alone. When that happens we accept
-    any frame in the matching file – `_frame_depth` then prefers the shallowest
-    candidate (the outer invocation), which is virtually always the one the
-    user is paused in unless they were inside a recursion. Recursion with an
-    empty func_hint will pick the outermost call, not the current one – an
-    acknowledged limitation of running without a func hint.
-
     Both endpath comparisons use `endswith` so the IDE-provided path can be
     absolute while the running interpreter sees a slightly different one
     (e.g. /private/var/... vs /var/... on macOS).
@@ -2533,29 +4080,27 @@ def _find_paused_user_frame(file_hint: str, func_hint: str) -> Any:
     import threading
     target_basename = file_hint.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
     candidates = []
-    match_func = func_hint != ""  # empty string = file-only match (debugpy fallback)
     for tid, top_frame in sys._current_frames().items():
         f = top_frame
         while f is not None:
             cf = f.f_code.co_filename
-            file_matches = (
+            if f.f_code.co_name == func_hint and (
                 cf == file_hint
                 or cf.endswith(file_hint)
                 or file_hint.endswith(cf)
                 or cf.rsplit("/", 1)[-1].rsplit("\\", 1)[-1] == target_basename
-            )
-            func_matches = (not match_func) or f.f_code.co_name == func_hint
-            if file_matches and func_matches:
+            ):
                 candidates.append(f)
             f = f.f_back
     if not candidates:
         raise RuntimeError(
-            f"watchpoint: could not locate paused frame for "
-            f"{func_hint or '<any func>'}() in {file_hint}"
+            f"watchpoint: could not locate paused frame for {func_hint}() in {file_hint}"
         )
-    # If multiple matches (recursion), prefer the SHALLOWEST – it's the outer
-    # invocation and most likely the one the user is paused in.
-    candidates.sort(key=lambda fr: _frame_depth(fr))
+    # If multiple matches (recursion), prefer the DEEPEST invocation. The IDE
+    # evaluator gives us only file + function, and the frame where execution is
+    # actually paused is normally the innermost matching recursive frame. Picking
+    # the outer frame arms a watch that misses the selected frame's next change.
+    candidates.sort(key=lambda fr: _frame_depth(fr), reverse=True)
     return candidates[0]
 
 
@@ -2575,146 +4120,155 @@ def watch_at(expr: str, file_hint: str, func_hint: str) -> str:
     Returns a short diagnostic string so the IDE can show success vs failure
     in its evaluator-result UI without throwing into the user's debug session.
     """
-    _dbg_log(f"watch_at entry: expr={expr!r}, file_hint={file_hint!r}, func_hint={func_hint!r}")
+    global _installing_watch_thread
     try:
         frame = _find_paused_user_frame(file_hint, func_hint)
-        _dbg_log(
-            f"watch_at: located frame id={id(frame)} "
-            f"({frame.f_code.co_filename}:{frame.f_code.co_name})"
-        )
     except Exception as e:
-        # On lookup failure dump every thread's top-of-stack so we can see WHY
-        # the heuristics in _find_paused_user_frame missed – under debugpy the
-        # filename PyCharm hands us may not match what sys._current_frames sees.
-        if _dbg_enabled():
-            import threading as _th
-            current = sys._current_frames()
-            for tid, top in current.items():
-                tname = next((t.name for t in _th.enumerate() if t.ident == tid), "?")
-                _dbg_log(
-                    f"watch_at: thread {tid} ({tname}) top frame "
-                    f"{top.f_code.co_filename}:{top.f_code.co_name}"
-                )
-        _dbg_log(f"watch_at: frame lookup FAILED: {e}")
         return f"ERROR: {e}"
     try:
-        _registry.add_watch(expr, frame)
-        _dbg_log(
-            f"watch_at: add_watch returned. "
-            f"local_watches now: {list(_registry._local_watches.keys())} "
-            f"attr_watches now: {list(_registry._attr_watches.keys())}"
-        )
+        _installing_watch_thread = threading.get_ident()
+        try:
+            _registry.add_watch(expr, frame)
+        finally:
+            _installing_watch_thread = None
     except Exception as e:
-        _dbg_log(f"watch_at: add_watch FAILED: {e!r}")
         return f"ERROR: add_watch failed: {e}"
     return f"OK: watching {expr!r} in {func_hint}()"
 
 
-def _hit_file_path() -> str:
-    """Canonical path for the last-hit JSON file.
+def _pycharm_consume_last_hit(pause_file: Optional[str] = None,
+                              pause_line: Optional[int] = None) -> str:
+    """Drain watchpoint hits matching the IDE's current pause location.
 
-    When the IDE plugin sets `PYCHARM_WATCHPOINT_HIT_DIR`, write into that
-    directory – it's the per-session temp dir the plugin already created (and
-    knows the path of), so the highlighter can read back without any
-    out-of-band PID extraction. Falls back to a PID-derived path in the system
-    temp dir when the env var isn't set (e.g. running under plain pytest with
-    no debugger), which makes the function safe to call from the test suite.
+    `pause_file` / `pause_line` (the user thread's topmost stack frame at
+    the moment of pause): if both provided, only hits whose installed bp
+    matches `(pause_file, pause_line)` are drained and returned – the
+    rest stay queued for their own future pauses. If either is None
+    (or both omitted, the legacy signature), every queued hit is drained
+    – used at session end / `clear_watches` and as the fallback when the
+    plugin cannot read the pause location from `XDebugSession`.
+
+    Empty string ⇒ no matching hits (typical when the pause was triggered
+    by a regular breakpoint or by a non-matching watchpoint bp). Otherwise
+    the result is one OR MORE base64-encoded hit payloads separated by `;`.
+    Each payload decodes to UTF-8 of five `\\x00`-separated fields:
+    file, line, name, old, new.
+
+    Why selective drain: with sequential pre-emptive bps, N back-to-back
+    mutations install N bps at N distinct lines and queue N hits. The IDE
+    will pause N times, once per bp. If the drain returned ALL queued
+    hits on the first pause, the user would see N highlights at once
+    (the original "two yellow lines at query.py:289 and :290" symptom)
+    and resume with an empty queue, missing the remaining N-1 pauses.
+    Filtering by `(pause_file, pause_line)` gives each pause its own
+    single matching hit and leaves the rest for next time.
+
+    Why `;` as the separator: it is NOT in the base64 alphabet
+    (A–Z, a–z, 0–9, +, /, =), so a simple split is unambiguous on the
+    Kotlin side.
+
+    Why base64 + NUL-separated payload (per hit) instead of JSON: pydevd
+    renders the evaluator result via repr(), which means any string value
+    would arrive on the Kotlin side wrapped in Python-style quoting with
+    backslash-escaped specials. Base64'ing each payload reduces decoding to
+    "strip outer quotes, split on `;`, base64-decode each" – no JSON parser,
+    no escape-sequence handling.
     """
-    import os, tempfile
-    plugin_dir = os.environ.get("PYCHARM_WATCHPOINT_HIT_DIR")
-    if plugin_dir:
-        return os.path.join(plugin_dir, "lasthit.json")
-    return os.path.join(tempfile.gettempdir(), f"pycharm_watchpoint_lasthit_{os.getpid()}.json")
+    reg = _registry
+    selective = pause_file is not None and pause_line is not None
+    if selective:
+        try:
+            pause_line_int = int(pause_line)
+        except (TypeError, ValueError):
+            pause_line_int = pause_line
+    else:
+        pause_line_int = None
 
+    with reg._lock:
+        if selective:
+            # A hit matches when ANY of its installed bps is at the
+            # IDE's current pause location. Each hit has up to two
+            # bps (primary at mutation site + safety at walked-up
+            # user code – see `_compute_bp_targets`); whichever
+            # fires first triggers the pause, and we drain the
+            # whole hit on the first match. Hits with empty
+            # `bp_locations` (do_wait_suspend fallback path) match
+            # ANY pause so they don't leak forever – their pause
+            # was triggered directly by `do_wait_suspend`, and the
+            # next consume drains them.
+            def matches(h: dict) -> bool:
+                locs = h.get("bp_locations", [])
+                if not locs:
+                    return True
+                return any(
+                    loc[0] == pause_file and loc[1] == pause_line_int
+                    for loc in locs
+                )
 
-def _emit_hit_marker(hit: dict) -> None:
-    """Publish the hit info to the IDE through two channels.
+            hits = [h for h in reg._hit_queue if matches(h)]
+            reg._hit_queue = [h for h in reg._hit_queue if not matches(h)]
+            # Collect every (file, line) belonging to a drained hit and
+            # remove its bps – this includes the SAFETY bp at the walked-
+            # up user code even when the PRIMARY bp at the mutation site
+            # is what just fired (and vice versa). Otherwise the unfired
+            # sibling bp would surface as a phantom pause later when
+            # execution naturally passes its line.
+            drained_locs: set = set()
+            for h in hits:
+                for loc in h.get("bp_locations", []):
+                    drained_locs.add((loc[0], loc[1]))
+                    # Clean _bp_pause_pending for drained hits so our
+                    # _on_line callback doesn't double-fire after pydevd
+                    # already handled the pause. loc[2] is the code object.
+                    if len(loc) > 2 and loc[2] is not None:
+                        reg._bp_pause_pending.pop(
+                            (id(loc[2]), loc[1]), None
+                        )
+            bps_to_remove = [
+                t for t in reg._temp_breakpoints
+                if (t[0], t[1]) in drained_locs
+            ]
+            reg._temp_breakpoints = [
+                t for t in reg._temp_breakpoints
+                if (t[0], t[1]) not in drained_locs
+            ]
+        else:
+            # Legacy drain-everything path. Used at session end and
+            # as the fallback when the IDE-side caller can't supply
+            # a pause location.
+            hits = list(reg._hit_queue)
+            reg._hit_queue.clear()
+            bps_to_remove = list(reg._temp_breakpoints)
+            reg._temp_breakpoints.clear()
+            reg._bp_pause_pending.clear()
+        if hits:
+            reg._last_hit = None
 
-    1. **Append-only JSON-lines file** (primary channel). Each hit is appended
-       as a single JSON object on its own line. The IDE plugin drains the file
-       (reads all lines, deletes) on every sessionPaused, so a pause that
-       coalesces multiple in-flight hits renders all of them.
+    # Remove any temp breakpoints we're cleaning up. The pydevd-side
+    # `consolidate_breakpoints` may take its own lock, so we make this
+    # call OUTSIDE `reg._lock` to avoid lock-order inversion.
+    if bps_to_remove:
+        py_db = _get_pydevd_debugger()
+        if py_db is not None:
+            _remove_temp_breakpoints(py_db, bps_to_remove)
 
-       Why append rather than overwrite: under pydevd's `CMD_STEP_OVER +
-       step_stop = user_frame` mechanism, pause materializes at the next LINE
-       event in the user frame – which doesn't fire if subsequent mutations
-       happen on consecutive lines with no intermediate non-mutation lines.
-       Under debugpy with PEP 669, multiple `step_stop` resets across hits
-       coalesce into a single pause. Both cases caused the single-slot file to
-       lose all hits except the most recent. Append mode preserves every hit.
-
-       Files are still per-session (PYCHARM_WATCHPOINT_HIT_DIR/lasthit.json),
-       so multiple concurrent watchpoint sessions don't share state.
-
-    2. `[WATCHPOINT/event]<base64>` line to stderr (secondary, Debug Console
-       visibility + fallback for backends where the file path isn't reachable).
-       Same NUL-separated encoding as the legacy `_pycharm_consume_last_hit`.
-
-    Both channels survive fd-level output capture (pytest's default), since
-    the file write is a direct filesystem operation untouched by stdio
-    redirection.
-    """
+    if not hits:
+        return ""
     import base64 as _b64
-    import json as _json
-
-    # File channel (primary). Append one JSON object per line. No atomic-rename
-    # gymnastics needed because append + line-buffered writes are themselves
-    # atomic at the line level on local filesystems; the IDE-side reader splits
-    # on newlines and ignores any partial trailing line.
-    try:
-        target = _hit_file_path()
-        with open(target, "a") as fh:
-            fh.write(_json.dumps(hit) + "\n")
-    except Exception:  # noqa: BLE001
-        pass
-
-    # Stderr marker (secondary).
-    try:
+    encoded_hits = []
+    for hit in hits:
         parts = [
             hit["file"],
             str(hit["line"]),
             hit["name"],
             hit["old"],
             hit["new"],
+            hit.get("caller_file", ""),
+            str(hit.get("caller_line", 0)),
         ]
         raw = "\x00".join(parts).encode("utf-8")
-        encoded = _b64.b64encode(raw).decode("ascii")
-        print(f"[WATCHPOINT/event]{encoded}", file=sys.stderr, flush=True)
-    except Exception:  # noqa: BLE001
-        pass
-
-
-def _pycharm_consume_last_hit() -> str:
-    """Return the most recent watchpoint hit, base64-encoded, then clear it.
-
-    Empty string ⇒ no pending hit (typical when the pause was triggered by a
-    regular breakpoint instead of a watchpoint). Otherwise the decoded payload
-    is a UTF-8 string of five `\\x00`-separated fields: file, line, name, old,
-    new. Reading consumes the hit so the same change is never highlighted twice.
-
-    Why base64 + NUL-separated and not JSON: pydevd renders the evaluator
-    result via repr(), which means any string value would arrive on the Kotlin
-    side wrapped in Python-style quoting with backslash-escaped specials.
-    Base64'ing the payload reduces decoding on the IDE side to "strip the
-    outer quotes pydevd added, then base64-decode" – no JSON parser, no
-    escape-sequence handling, no Gson dependency.
-    """
-    reg = _registry
-    with reg._lock:
-        hit = reg._last_hit
-        reg._last_hit = None
-    if hit is None:
-        return ""
-    import base64 as _b64
-    parts = [
-        hit["file"],
-        str(hit["line"]),
-        hit["name"],
-        hit["old"],
-        hit["new"],
-    ]
-    raw = "\x00".join(parts).encode("utf-8")
-    return _b64.b64encode(raw).decode("ascii")
+        encoded_hits.append(_b64.b64encode(raw).decode("ascii"))
+    return ";".join(encoded_hits)
 
 
 # Expose via builtins so PyCharm plugin can call them without importing.
@@ -2723,28 +4277,17 @@ builtins._pycharm_watch_at = watch_at
 builtins._pycharm_unwatch = unwatch
 builtins._pycharm_clear_watches = clear_watches
 builtins._pycharm_watchpoint_diag = _pycharm_watchpoint_diag
-builtins._pycharm_watchpoint_state = _pycharm_watchpoint_state
-builtins._pycharm_log_state = _pycharm_log_state
 builtins._pycharm_consume_last_hit = _pycharm_consume_last_hit
 
-# Announce backend at load time. Visible in the Debug Console alongside the
-# existing `[WATCHPOINT] Loaded in process N` line emitted by sitecustomize.
-# Crucial under debugpy: gives us proof the runtime actually loaded in the
-# user-code interpreter (vs. some debugpy sidecar process).
-#
-# Heads-up about the detected value at this point: sitecustomize runs during
-# Python startup, BEFORE the debug bootstrap (pydevd or debugpy) imports its
-# debugger module. So under debugpy especially, this almost always prints
-# `boot-backend: none` – it's not lying, debugpy literally isn't loaded yet.
-# `_detect_debugger()` is a live lookup, so every later call (incl. inside
-# `_handle_hit`) sees the actual backend.
-try:
-    print(
-        f"[WATCHPOINT] Runtime ready – boot-backend: {_detect_debugger()} "
-        f"(re-detected lazily on each event); "
-        f"hit-dir: {os.environ.get('PYCHARM_WATCHPOINT_HIT_DIR') or '<unset>'}",
-        file=sys.stderr,
-        flush=True,
-    )
-except Exception:  # noqa: BLE001
-    pass
+
+# Fingerprint line: when the user reports "I rebuilt and it still doesn't
+# work", this is the first thing we check in /tmp/pythonwatchpoint.log –
+# if the version stamp matches the latest fix, the rebuild took. If it's
+# missing or stale, gradle didn't pick up the resource change.
+# Also surfaces `_STDLIB_DIR_PREFIX` so we can confirm the stdlib filter
+# is using the right path for THIS Python install (uv-managed Pythons
+# sit under custom roots that we want to confirm are detected).
+_log_warn(
+    f"runtime loaded: version={_RUNTIME_VERSION} "
+    f"stdlib_prefix={_STDLIB_DIR_PREFIX!r}"
+)
