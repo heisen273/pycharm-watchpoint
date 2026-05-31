@@ -77,7 +77,26 @@ class AddWatchpointAction : AnAction() {
             return
         }
         val service = WatchpointMarkerService.getInstance(project)
-        val allWatched = paths.all { service.isWatched(it) }
+        val session = XDebuggerManager.getInstance(project).currentSession
+        val labelFrameId: Long? = try {
+            (session?.currentStackFrame as? PyStackFrame)?.frameId?.toLongOrNull()
+        } catch (e: Exception) { null }
+        // Mirror the three-pronged watched check from WatchpointTreeCellRenderer so that
+        // the menu label agrees with what the icon shows:
+        //   1. Frame-scoped marker (works when paused in the same frame the watch was armed)
+        //   2. Name-only marker fallback (works for rebind-only watches like Django model
+        //      `obj` where __class__ surgery is refused — same expression name, different frame)
+        //   3. Type-sniff on the node's PyDebugValue (works for __class__-surgery watches
+        //      like `request` travelling through middleware frames)
+        fun isNodeWatched(path: String, node: XValueNodeImpl): Boolean {
+            if (labelFrameId != null && service.isWatched(path, labelFrameId)) return true
+            if (service.isWatched(path)) return true
+            val pyType = (node.valueContainer as? PyDebugValue)?.type ?: return false
+            return pyType.startsWith("_Watched")
+        }
+        val allWatched = nodes
+            .mapNotNull { n -> calculateFullPath(n).takeIf(String::isNotEmpty)?.let { n to it } }
+            .all { (node, path) -> isNodeWatched(path, node) }
         val plural = paths.size > 1
         e.presentation.isEnabledAndVisible = true
         e.presentation.text = when {
@@ -108,7 +127,31 @@ class AddWatchpointAction : AnAction() {
             .distinctBy { it.second }
         if (pairs.isEmpty()) return
 
-        val allWatched = pairs.all { service.isWatched(it.second) }
+        // Resolve the current frame up-front — needed both to scope isWatched
+        // (so "self" in a different frame doesn't look watched) and to pass
+        // (file, func) to watch_at for arming.
+        val currentFrame = session.currentStackFrame
+        val frameFile = currentFrame?.sourcePosition?.file?.path
+        val frameFuncName = (currentFrame as? PyStackFrame)?.name
+        val currentFrameId: Long? = try {
+            (currentFrame as? PyStackFrame)?.frameId?.toLongOrNull()
+        } catch (e: Exception) { null }
+
+        // Three-pronged check matching update() and WatchpointTreeCellRenderer:
+        //   1. Frame-scoped marker: exact frame the watch was armed against.
+        //   2. Name-only marker: catches rebind-only watches (Django models) where
+        //      __class__ surgery was refused and the hit fires in a callee frame
+        //      that also has the variable in scope with the same name.
+        //   3. Type-sniff: catches __class__-surgery watches (request, etc.) where
+        //      the object's type has been mutated to _WatchedAny* by watchpoint.py.
+        fun isWatchedHere(expr: String, node: XValueNodeImpl): Boolean {
+            if (currentFrameId != null && service.isWatched(expr, currentFrameId)) return true
+            if (service.isWatched(expr)) return true
+            val pyType = (node.valueContainer as? PyDebugValue)?.type ?: return false
+            return pyType.startsWith("_Watched")
+        }
+
+        val allWatched = pairs.all { (node, path) -> isWatchedHere(path, node) }
         if (allWatched) {
             // Remove path: doesn't need any frame info – the runtime keys
             // watches by expression string, so `_pycharm_unwatch('expr')` is
@@ -122,9 +165,6 @@ class AddWatchpointAction : AnAction() {
         // and arm a watch against its real code object. See CLAUDE.md
         // "Frame discovery for the PyCharm action" for why the evaluator's
         // own sys._getframe() stack is the WRONG one to use here.
-        val currentFrame = session.currentStackFrame
-        val frameFile = currentFrame?.sourcePosition?.file?.path
-        val frameFuncName = (currentFrame as? PyStackFrame)?.name
         if (frameFile == null || frameFuncName == null) {
             notify(project, "Cannot add watchpoint: no current Python frame", NotificationType.ERROR)
             return
@@ -132,7 +172,7 @@ class AddWatchpointAction : AnAction() {
 
         // In a mixed selection, only arm the unwatched ones – the already-
         // watched ones stay armed (user can issue an explicit Remove later).
-        pairs.filterNot { service.isWatched(it.second) }
+        pairs.filterNot { (node, path) -> isWatchedHere(path, node) }
             .forEach { (node, path) -> addWatchpoint(project, debugProcess, node, path, frameFile, frameFuncName) }
     }
 
@@ -172,8 +212,13 @@ class AddWatchpointAction : AnAction() {
                     notify(project, "Watchpoint failed: $rawValue", NotificationType.ERROR)
                     return
                 }
+                // watch_at now returns str(id(frame)) on success – the Python
+                // id of the exact frame instance that was armed. We store it
+                // alongside the expression so the tree renderer can match only
+                // the specific frame, not every variable with the same name.
+                val frameId = rawValue.trim().toLongOrNull() ?: 0L
                 ApplicationManager.getApplication().invokeLater {
-                    decorateNode(project, node.tree, fullPath)
+                    decorateNode(project, node.tree, fullPath, frameId)
                     // Re-fetch all variables so the row's type/repr reflects the new
                     // `_WatchedAny_<Class>` wrapper instead of the original cached `<Class>`.
                     refreshVariablesView(project)
@@ -284,16 +329,16 @@ class AddWatchpointAction : AnAction() {
     }
 
     /**
-     * Register [fullPath] as a watched expression with the marker service and
-     * make sure the Variables tree is running our cell renderer that surfaces
-     * the highlight. Both operations are idempotent – calling them again for
-     * an already-watched path or already-wrapped tree is a no-op.
+     * Register [fullPath] as a watched expression (armed against [frameId]) with
+     * the marker service and make sure the Variables tree is running our cell
+     * renderer that surfaces the highlight. Both operations are idempotent –
+     * calling them again for an already-watched path or already-wrapped tree is a no-op.
      */
-    private fun decorateNode(project: Project, tree: XDebuggerTree, fullPath: String) {
+    private fun decorateNode(project: Project, tree: XDebuggerTree, fullPath: String, frameId: Long) {
         try {
             val service = WatchpointMarkerService.getInstance(project)
-            service.add(fullPath)
-            ensureCellRendererInstalled(tree, service)
+            service.add(fullPath, frameId)
+            ensureCellRendererInstalled(tree, service, project)
             tree.repaint()
         } catch (e: Exception) {
             // Decoration is a UX nicety, not load-bearing. If anything refuses,
@@ -325,9 +370,9 @@ class AddWatchpointAction : AnAction() {
      * renderer becomes a delegate, our wrapper checks each cell against the
      * marker service before deciding whether to layer decoration.
      */
-    private fun ensureCellRendererInstalled(tree: XDebuggerTree, service: WatchpointMarkerService) {
+    private fun ensureCellRendererInstalled(tree: XDebuggerTree, service: WatchpointMarkerService, project: Project) {
         val current = tree.cellRenderer
         if (current is WatchpointTreeCellRenderer) return
-        tree.cellRenderer = WatchpointTreeCellRenderer(current, service)
+        tree.cellRenderer = WatchpointTreeCellRenderer(current, service, project)
     }
 }

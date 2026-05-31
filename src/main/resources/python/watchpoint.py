@@ -4162,7 +4162,12 @@ def watch_at(expr: str, file_hint: str, func_hint: str) -> str:
             _installing_watch_thread = None
     except Exception as e:
         return f"ERROR: add_watch failed: {e}"
-    return f"OK: watching {expr!r} in {func_hint}()"
+    # Return the Python id() of the frame so the IDE can key the highlight to
+    # this specific frame instance (not just the variable name). The Kotlin side
+    # parses this as a Long and stores it alongside the expression in
+    # WatchpointMarkerService, which the tree-cell renderer then uses to avoid
+    # decorating same-named variables in unrelated frames.
+    return str(id(frame))
 
 
 def _pycharm_consume_last_hit(pause_file: Optional[str] = None,

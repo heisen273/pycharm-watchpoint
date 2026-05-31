@@ -85,7 +85,11 @@ class WatchpointDebugListener(private val project: Project) : XDebuggerManagerLi
     private fun attachHitHighlighter(debugProcess: PyDebugProcess) {
         try {
             val session = debugProcess.session
-            val highlighter = WatchpointHitHighlighter(project, session)
+            val highlighter = WatchpointHitHighlighter(
+                project,
+                session,
+                WatchpointMarkerService.getInstance(project),
+            )
             session.addSessionListener(highlighter)
             highlighters[debugProcess] = highlighter
         } catch (e: Exception) {

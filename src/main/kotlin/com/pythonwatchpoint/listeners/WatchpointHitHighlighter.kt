@@ -23,6 +23,8 @@ import com.intellij.util.ui.JBUI
 import com.intellij.xdebugger.XDebugSession
 import com.intellij.xdebugger.XDebugSessionListener
 import com.jetbrains.python.debugger.PyDebugProcess
+import com.jetbrains.python.debugger.PyStackFrame
+import com.pythonwatchpoint.services.WatchpointMarkerService
 import java.awt.Color
 import java.awt.Font
 import java.awt.Graphics
@@ -54,6 +56,7 @@ import java.util.Base64
 class WatchpointHitHighlighter(
     private val project: Project,
     private val session: XDebugSession,
+    private val markerService: WatchpointMarkerService,
 ) : XDebugSessionListener {
     private val logger = Logger.getInstance(WatchpointHitHighlighter::class.java)
 
@@ -129,6 +132,19 @@ class WatchpointHitHighlighter(
         val pauseFile = sourcePosition?.file?.path
         val pauseLine = sourcePosition?.line?.plus(1)  // line is 0-based; Python is 1-based
 
+        // Snapshot the paused frame's ID on the EDT so we can register watched
+        // names against it below. This is the id() of the frame where pydevd
+        // actually stopped — typically a middleware or library frame, NOT the
+        // frame where the user armed the watch. We need this to make the
+        // Variables-tree renderer find the watch entry: the renderer queries
+        // markerService.isWatched(name, currentFrameId) and currentFrameId is
+        // always the paused frame, so we must register against THAT id too.
+        val pausedFrameId: Long? = try {
+            (session.currentStackFrame as? PyStackFrame)?.frameId?.toLongOrNull()
+        } catch (e: Exception) {
+            null
+        }
+
         // Why not the generic XDebuggerEvaluator: that path returns a PyDebugValue
         // whose `value` field is the variables-panel DISPLAY string, truncated to
         // PyDebugValue.MAX_VALUE (256 chars). Our base64 payload routinely exceeds
@@ -176,6 +192,22 @@ class WatchpointHitHighlighter(
             }
             if (hits.size > 1) {
                 logger.warn("sessionPaused: drained ${hits.size} queued watchpoint hits")
+            }
+
+            // Register each fired watch name against the current paused frame so
+            // the Variables-tree renderer can highlight the row. The renderer
+            // queries markerService.isWatched(name, currentFrameId) where
+            // currentFrameId is always the frame pydevd is paused in — which for
+            // attribute watches (e.g. `request`) is typically a DIFFERENT frame
+            // from the one the user was in when they clicked "Add Watchpoint".
+            // Without this, the icon never renders for cross-frame attribute hits.
+            //
+            // We use the pausedFrameId captured on the EDT above. If it wasn't
+            // available (rare teardown race), skip — the original armed-frame
+            // entry still exists and handles the case where the renderer IS
+            // showing that frame.
+            if (pausedFrameId != null) {
+                hits.forEach { hit -> markerService.add(hit.name, pausedFrameId) }
             }
             // Two-phase approach:
             // Phase 1 (immediate): apply the highlight decoration so the
