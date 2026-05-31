@@ -3039,7 +3039,7 @@ except Exception:
 # a bug we can confirm from /tmp/pythonwatchpoint.log which version of
 # the runtime is actually loaded in their session – distinguishing
 # "my fix didn't help" from "you're running an older bundled copy."
-_RUNTIME_VERSION = "2026-05-31-reject-backward-bp-line-v21"
+_RUNTIME_VERSION = "2026-05-31-loop-back-bp-target-v24"
 
 
 def _is_library_filename(path: str) -> bool:
@@ -3582,6 +3582,17 @@ def _next_code_line_in(code: Any, after_line: int) -> Optional[int]:
         return None
 
 
+def _offset_to_line(code: Any, offset: int) -> Optional[int]:
+    """Map a bytecode offset to its source line via co_lines()."""
+    try:
+        for start, end, line in code.co_lines():
+            if line is not None and start <= offset < end:
+                return line
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
 def _next_code_line_after_frame(frame: Any) -> Optional[int]:
     """Find the next LINE event after the frame's current bytecode offset.
 
@@ -3595,13 +3606,14 @@ def _next_code_line_after_frame(frame: Any) -> Optional[int]:
     except handler next, but that line is unreachable on the no-exception path
     and a breakpoint there would sit inert until a distant safety net fires.
 
-    Backward-pointing lines are also rejected. CPython's RETURN_CONST at the
-    end of a function can be tagged with an earlier source line (e.g. the
-    closing bracket of a multi-line expression). If the mutation is on the
-    function's last statement, the next bytecode instruction may point at a
-    line BEFORE the current one – that line has already executed and a bp
-    there will never fire. Requiring `line > current_line` catches this edge
-    case and lets the caller fall through to the f_back walk.
+    Backward-pointing lines are rejected UNLESS they are loop back-edge
+    targets (JUMP_BACKWARD). In a tight loop like
+    ``for i in range(N): setattr(...)``, the next bytecode after setattr is
+    JUMP_BACKWARD to the for-header. That line WILL execute again on the
+    next iteration, making it a valid bp target. Without this, tight loops
+    exhaust the primary slot and spill bps into caller frames (often library
+    code). The target line is resolved via co_lines() because
+    JUMP_BACKWARD itself has no starts_line attribute.
     """
     lasti = getattr(frame, "f_lasti", None)
     if lasti is None:
@@ -3610,15 +3622,26 @@ def _next_code_line_after_frame(frame: Any) -> Optional[int]:
         import dis
         current_line = getattr(frame, "f_lineno", None)
         handler_lines = _get_except_handler_lines(frame.f_code)
+        loop_back_line = None
         for inst in dis.get_instructions(frame.f_code):
             if inst.offset <= lasti:
                 continue
+            if (loop_back_line is None
+                    and current_line is not None
+                    and inst.opname in ("JUMP_BACKWARD",
+                                        "JUMP_BACKWARD_NO_INTERRUPT")):
+                target_line = _offset_to_line(frame.f_code, inst.argval)
+                if (target_line is not None
+                        and target_line != current_line
+                        and target_line not in handler_lines):
+                    loop_back_line = target_line
             line = _instruction_starts_line(inst)
             if (line is not None
                     and line != current_line
                     and (current_line is None or line > current_line)
                     and line not in handler_lines):
                 return line
+        return loop_back_line
     except Exception:  # noqa: BLE001
         return None
     return None
