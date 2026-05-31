@@ -1351,7 +1351,7 @@ executing frame" focus. Tests: `test_watch_at_locates_paused_frame_in_other_thre
 - **Raise the depth cap blindly.** The cap is bounded by `_RECURSIVE_OBJECT_WATCH_DEPTH = 4`
   for memory + startup time reasons. Each level multiplies the number of
   installed watcher classes; a fan-out of N at every level gives N^depth
-  classes. The pythonvartracker reference chose 4 for the same reason.
+  classes. 4 is a pragmatic default chosen for the same reason.
 - **Drop the per-instance filter from classpatch `patched_setattr`.** The
   `entries = _patch.instance_watches.get(id(self_obj))` gate is what
   keeps unrelated instances of the patched class from firing. Removing

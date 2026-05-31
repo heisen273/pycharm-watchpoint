@@ -50,8 +50,8 @@ org.gradle.java.home=/opt/homebrew/Cellar/openjdk@21/21.0.11/libexec/openjdk.jdk
 `settings.gradle.kts`:
 
 - Has the awkward `rootProject.name = "..."` line *before* `pluginManagement`.
-  Despite Gradle docs saying `pluginManagement` should be first, this matches
-  the reference `pythonvartracker` setup and works.
+  Despite Gradle docs saying `pluginManagement` should be first, this ordering
+  works and matches IntelliJ Platform plugin conventions.
 
 ## Long-running daemon trap
 

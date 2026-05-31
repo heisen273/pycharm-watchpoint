@@ -2805,7 +2805,7 @@ _LOCAL_WATCH_BUILTIN_TYPES = (
 # How many levels of nested user-defined attributes `_instrument_object_tree`
 # walks beneath the root watch. Depth 0 is the root itself (installed by
 # the caller); depth 1 is its direct attrs, depth 2 its grandchildren, etc.
-# 4 levels deep matches `pythonvartracker`'s reference value – deep enough
+# 4 levels deep is a pragmatic default – deep enough
 # for typical DTO graphs without runaway instrumentation cost on huge object
 # trees. Cycle guard is independent (per-call `visited` set).
 _RECURSIVE_OBJECT_WATCH_DEPTH = 4

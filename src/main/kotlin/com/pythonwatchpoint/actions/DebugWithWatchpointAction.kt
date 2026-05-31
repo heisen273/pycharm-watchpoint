@@ -23,7 +23,7 @@ import java.util.Base64
  * start-up, then launches a debug session on the clone. The original config is
  * left untouched so plain "Debug" still produces a clean session.
  *
- * Mirror of DebugWithTrackerAction (pythonvartracker) so the UX matches.
+ * Clones the selected run config so the original stays clean.
  */
 class DebugWithWatchpointAction : AnAction(), DumbAware {
     private val logger = Logger.getInstance(DebugWithWatchpointAction::class.java)
