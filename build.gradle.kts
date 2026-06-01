@@ -1,4 +1,5 @@
 import org.jetbrains.intellij.platform.gradle.TestFrameworkType
+import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
 
 plugins {
     id("java")
@@ -21,7 +22,8 @@ repositories {
 
 dependencies {
     intellijPlatform {
-        pycharmCommunity("2025.1")
+        pycharm("2026.1")
+//        pycharmCommunity("2025.1")
         bundledPlugin("PythonCore")
 
         pluginVerifier()
@@ -29,16 +31,35 @@ dependencies {
     }
 }
 
-java {
-    sourceCompatibility = JavaVersion.VERSION_21
-    targetCompatibility = JavaVersion.VERSION_21
-}
-
 kotlin {
+    // Build with JBR 21 (matches org.gradle.java.home in gradle.properties).
     jvmToolchain {
         languageVersion.set(JavaLanguageVersion.of(21))
         vendor.set(JvmVendorSpec.JETBRAINS)
     }
+}
+
+// ---- JVM bytecode target: 17 --------------------------------------------------
+// JVM 17 class files (version 61.0) load in PyCharm 2023.x (JBR 17) through
+// 2026.x (JBR 21) – forward-compatible with every supported build.
+//
+// We configure BOTH tasks here because:
+//  - jvmToolchain(21) overrides the kotlin {} compilerOptions block in KGP 2.x.
+//  - jvmToolchain(21) also drives compileJava, ignoring java { targetCompatibility }.
+//  - KGP 2.x validates that compileJava and compileKotlin agree; if they differ
+//    it refuses to build ("Inconsistent JVM-target compatibility"). Configuring
+//    both tasks in the same place keeps them in sync.
+// -------------------------------------------------------------------------------
+
+tasks.withType<KotlinCompile>().configureEach {
+    compilerOptions {
+        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+    }
+}
+
+// options.release hard-pins the javac output regardless of toolchain JDK version.
+tasks.withType<JavaCompile>().configureEach {
+    options.release.set(17)
 }
 
 intellijPlatform {
@@ -46,7 +67,7 @@ intellijPlatform {
 
     pluginConfiguration {
         ideaVersion {
-            sinceBuild = "243"
+            sinceBuild = "231"
             untilBuild = "261.*"
         }
     }

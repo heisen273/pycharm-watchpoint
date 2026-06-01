@@ -1,7 +1,5 @@
 package com.pythonwatchpoint.actions
 
-import com.intellij.notification.NotificationGroupManager
-import com.intellij.notification.NotificationType
 import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.application.ApplicationManager
@@ -166,7 +164,7 @@ class AddWatchpointAction : AnAction() {
         // "Frame discovery for the PyCharm action" for why the evaluator's
         // own sys._getframe() stack is the WRONG one to use here.
         if (frameFile == null || frameFuncName == null) {
-            notify(project, "Cannot add watchpoint: no current Python frame", NotificationType.ERROR)
+            notifyError(project, "Cannot add watchpoint: no current Python frame")
             return
         }
 
@@ -209,7 +207,7 @@ class AddWatchpointAction : AnAction() {
                 // Use PyDebugValue.value for the actual Python return.
                 val rawValue = (result as? PyDebugValue)?.value ?: result.toString()
                 if (rawValue.startsWith("ERROR:")) {
-                    notify(project, "Watchpoint failed: $rawValue", NotificationType.ERROR)
+                    notifyError(project, "Watchpoint failed: $rawValue")
                     return
                 }
                 // watch_at now returns str(id(frame)) on success – the Python
@@ -226,7 +224,7 @@ class AddWatchpointAction : AnAction() {
             }
             override fun errorOccurred(errorMessage: String) {
                 logger.warn("Failed to arm watchpoint '$fullPath': $errorMessage")
-                notify(project, "Could not add watchpoint on $fullPath: $errorMessage", NotificationType.ERROR)
+                notifyError(project, "Could not add watchpoint on $fullPath: $errorMessage")
             }
         }, null)
     }
@@ -265,7 +263,7 @@ class AddWatchpointAction : AnAction() {
             }
             override fun errorOccurred(errorMessage: String) {
                 logger.warn("Failed to remove watchpoint '$fullPath': $errorMessage")
-                notify(project, "Could not remove watchpoint on $fullPath: $errorMessage", NotificationType.ERROR)
+                notifyError(project, "Could not remove watchpoint on $fullPath: $errorMessage")
             }
         }, null)
     }
@@ -276,13 +274,43 @@ class AddWatchpointAction : AnAction() {
      * `session.rebuildViews()` dispatches a FRAME_CHANGED event to ALL debug
      * views (variables, frames, watches), which causes the Frames panel to
      * reset its selection to the topmost frame – losing the user's scroll
-     * position. Instead, we send the event only to the Variables view so
-     * variable repr/type is re-fetched while the frame selection stays put.
+     * position. Instead we send FRAME_CHANGED only to the Variables view.
+     *
+     * `getSessionTab()` and `getVariablesView()` are both `@ApiStatus.Internal`
+     * and `getVariablesView()` didn't exist before PyCharm 2025. We therefore
+     * call them via reflection so the plugin compiles and runs on the full
+     * 2024–2026 range. Falls back to `rebuildViews()` on builds where either
+     * method is absent (the frame-reset side-effect is acceptable vs. stale icons).
      */
+    @Suppress("UnstableApiUsage")
     private fun refreshVariablesView(project: Project) {
         val session = XDebuggerManager.getInstance(project).currentSession as? XDebugSessionImpl ?: return
-        val variablesView = session.sessionTab?.variablesView ?: return
-        variablesView.processSessionEvent(XDebugView.SessionEvent.FRAME_CHANGED, session)
+
+        val refreshed = runCatching {
+            // Step 1: sessionTab – exists on all target builds but is @Internal.
+            val sessionTab = session.sessionTab ?: return@runCatching false
+
+            // Step 2: variablesView – added after 2024.3, must be called reflectively.
+            val view = sessionTab.javaClass
+                .getMethod("getVariablesView")
+                .invoke(sessionTab) ?: return@runCatching false
+
+            // Step 3: dispatch FRAME_CHANGED to the view only.
+            view.javaClass
+                .getMethod(
+                    "processSessionEvent",
+                    XDebugView.SessionEvent::class.java,
+                    com.intellij.xdebugger.XDebugSession::class.java,
+                )
+                .invoke(view, XDebugView.SessionEvent.FRAME_CHANGED, session)
+            true
+        }.getOrDefault(false)
+
+        if (!refreshed) {
+            // Fallback for 2024.x: full rebuild resets the Frames panel selection
+            // but keeps variable icons up-to-date on older builds.
+            session.rebuildViews()
+        }
     }
 
     /**
@@ -319,13 +347,34 @@ class AddWatchpointAction : AnAction() {
         return parts.joinToString(".")
     }
 
-    private fun notify(project: Project, message: String, type: NotificationType) {
-        // "Debugger messages" is bundled and always available. Reserved for
-        // errors only – success is signalled by the in-tree icon swap.
-        NotificationGroupManager.getInstance()
-            .getNotificationGroup("Debugger messages")
-            .createNotification(message, type)
-            .notify(project)
+
+    /**
+     * Show an IDE error balloon for watchpoint failures.
+     *
+     * Uses reflection for the entire `NotificationGroupManager` call chain so
+     * the plugin compiles against PyCharm 2022.2+ where `com.intellij.notification`
+     * may not be in the default compile classpath for the Gradle 2.x plugin. Falls
+     * back to a logger.warn() so the message is never silently swallowed.
+     */
+    private fun notifyError(project: Project, message: String) {
+        val shown = runCatching {
+            val managerClass = Class.forName("com.intellij.notification.NotificationGroupManager")
+            val manager = managerClass.getMethod("getInstance").invoke(null)
+            val group = manager.javaClass
+                .getMethod("getNotificationGroup", String::class.java)
+                .invoke(manager, "Debugger messages") ?: return@runCatching false
+            val typeClass = Class.forName("com.intellij.notification.NotificationType")
+            val errorType = typeClass.enumConstants
+                ?.find { (it as Enum<*>).name == "ERROR" } ?: return@runCatching false
+            val notif = group.javaClass
+                .getMethod("createNotification", String::class.java, typeClass)
+                .invoke(group, message, errorType) ?: return@runCatching false
+            notif.javaClass
+                .getMethod("notify", Class.forName("com.intellij.openapi.project.Project"))
+                .invoke(notif, project)
+            true
+        }.getOrDefault(false)
+        if (!shown) logger.warn("Watchpoint error (could not display as balloon): $message")
     }
 
     /**
