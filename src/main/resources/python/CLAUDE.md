@@ -6,7 +6,7 @@
 ## TL;DR
 
 - `watchpoint.py` – runtime: registry, sys.monitoring callbacks, pydevd integration.
-- `test_watchpoint.py` – 190 tests, pure-pytest (no pydevd).
+- `test_watchpoint.py` – 198 tests, pure-pytest (no pydevd).
 - `conftest.py` – per-test cleanup of registry + frame state.
 - Targets **Python 3.12, 3.13, 3.14**.
 - **Zero global sys.monitoring overhead** until the first `watch()` call.
@@ -40,7 +40,7 @@ builtins._watchpoint_registry    # the singleton, for conftest cleanup
 | Resolved value             | Watch installed                                                           |
 | -------------------------- | ------------------------------------------------------------------------- |
 | primitive / list / dict …  | **local-variable** (LINE-event diff per frame)                            |
-| user-defined object        | **object-wide attribute** + recursive instrumentation to depth 4 (§9)    |
+| user-defined object        | **object-wide attribute** + recursive instrumentation to depth 4 (§9) + **local-variable rebind watch** (detects name reassignment via id change) |
 | `"a.b.c"` (dotted)        | **specific attribute**; if leaf is list/dict/set, also container-wrap (§9)|
 
 ## Design contract – critical invariants
@@ -185,7 +185,7 @@ info.pydev_step_stop = user_frame
 | Concern                             | Behavior                                                                   |
 | ----------------------------------- | -------------------------------------------------------------------------- |
 | `sys.monitoring` API                | Stable since 3.12. Same callback signatures.                               |
-| `frame.f_locals`                    | 3.13: fresh `FrameLocalsProxy` each access. Always `dict(frame.f_locals)` once. |
+| `frame.f_locals`                    | 3.13: fresh `FrameLocalsProxy` each access. `_on_line`/`_on_py_return` resolve via `eval(name, f_globals, f_locals)` – NOT `dict(f_locals).get(name)` – so `global` and `nonlocal` variables are visible. |
 | LINE-callback exception propagation | **3.14 bypasses local `try/except` in the monitored frame.** Tests wrap monitored code in an inner helper. |
 | `PY_UNWIND` as local event          | Rejected on all 3.12+ (`ValueError`). Confirmed empirically.              |
 | `PY_START` as local event           | Works on 3.12+. Used for id-reuse cleanup.                                |
@@ -194,7 +194,7 @@ info.pydev_step_stop = user_frame
 
 - Immutables: `hash((type, value))` – type-tagged so `1 == True` doesn't mask type change.
 - Mutable containers: `hash(repr(value))`.
-- Custom objects: `id(value) ^ hash(type.__qualname__)` – in-place mutation NOT detected (use object-wide watching).
+- Custom objects: `id(value)` – identity-only; in-place mutation NOT detected (use object-wide watching). Intentionally omits `type.__qualname__` because our own class-surgery changes the qualname, which would cause spurious fires on the rebind-watch that accompanies every object watch.
 
 ## Frame discovery for the PyCharm action
 
@@ -270,6 +270,9 @@ info.pydev_step_stop = user_frame
 - **DON'T** use a simple bool for `_installing_watch_thread`. Thread-scoped so other threads still fire during installation.
 - **DON'T** clean up `_bp_pause_pending` lazily ("let them die in `_on_line`"). Stale entries would spuriously trigger direct-pause for future executions of the same code+line.
 - **DON'T** coalesce bulk mutations from the same source line into one queued hit. Users want N pauses for N mutations, not 1 coalesced stop. The loop-back bp target (v24) solves the tight-loop case properly.
+- **DON'T** add `hash(type.__qualname__)` back to `_value_hash` for custom objects. Our class-surgery changes `__class__` (and thus qualname), causing spurious fires on the rebind-watch that accompanies every object watch. Identity-only (`id()`) is correct.
+- **DON'T** remove the local-variable watch installed alongside `_add_object_watch`. It detects name rebinding (e.g. `obj = OtherThing()`). Without it, reassigning the watched name is silently missed.
+- **DON'T** use `dict(frame.f_locals).get(name)` in `_on_line`/`_on_py_return`. Misses globals and nonlocals. Use `eval(name, frame.f_globals, frame.f_locals)` instead.
 - **DON'T filter all library frames in the f_back walk of `_compute_bp_targets`.** Site-packages frames are valid bp targets – pydevd CAN pause there via LineBreakpoint. Filtering them pushes bps to distant frames that fire late, scrambling hit ordering in Django middleware stacks. Tried and reverted (v24).
   - **DO** filter **pydevd-internal** frames specifically (`_is_pydevd_internal`). PyDevD won't pause on breakpoints installed inside its own infrastructure (`helpers/pydev/pydevd.py` etc.), so those frames must be skipped or the pause is silently swallowed (observed on PyCharm 2025.3 when mutation is on the last line of a function).
 
@@ -294,8 +297,10 @@ info.pydev_step_stop = user_frame
 - **Class objects** – not recursed into (descriptor-laden `__dict__`).
 - **Hits from pure runtime frame chains are silently dropped** to prevent flooding pydevd's queue with `<string>:NNN`.
 - **Mutations that happen mid-deepcopy / mid-pickle** are silent when the contained values can't be repr'd (returns `"<unreprable>"`, diff produces no hit – correct trade-off).
+- **Asyncio task cancellation leaks watch state.** `PY_RETURN` doesn't reliably fire for cancelled coroutine frames. Stale entries are cleaned by `clear_watches()` on the next session start. Pinned by xfail test.
+- **C-extension in-place mutation invisible.** `_value_hash` for custom objects uses `id()` only – numpy array `a[0] = 99` doesn't change identity. Watch the dotted path or rebind instead.
 
-## Test layout (15 bands, 189 tests)
+## Test layout (16 bands, 198 tests)
 
 1. **Basics** – fire on change, old/new, source line, unwatch, clear, multiple watches.
 2. **Frame lifetime** – repeated calls, recursion, stale-state reset.
@@ -312,6 +317,7 @@ info.pydev_step_stop = user_frame
 13. **v13 direct-pause dispatch** – `_bp_pause_pending` mechanics; `_on_line` dispatch; cleanup on consume.
 14. **Installation side-effect suppression** – `_installing_watch_thread` flag; thread-scoped; flag cleared on exception; baseline preserved.
 15. **Hit payload caller info** – `caller_file`/`caller_line` fields for secondary Kotlin-side highlight.
+16. **Edge-case coverage** – global variable watch, nonlocal variable watch, generator `send()` rebinding, variable shadowing in nested scopes, object-watch name rebinding, asyncio task cancellation cleanup (xfail – known stale-watch leak).
 
 Tests use `def _code(): ...; with pytest.raises(WatchpointHit): _code()` pattern because 3.14 LINE-exception propagation bypasses `try/except` in the monitored frame.
 

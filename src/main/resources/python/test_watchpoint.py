@@ -5942,3 +5942,166 @@ def test_watch_list_inplace_mutation_via_line_diff():
     assert "[1, 2, 3]" in exc_info.value.new_value
 
 
+def test_object_watch_detects_name_rebinding():
+    """watch('obj') on a user-defined object should ALSO detect when 'obj'
+    itself is rebound to a different object – not just attribute mutations.
+
+    Currently FAILS: class-surgery path returns early without installing a
+    local-variable watch, so rebinding the name goes undetected.
+    """
+    class Thing:
+        val = 1
+
+    def _code():
+        obj = Thing()
+        watch("obj")
+        obj = Thing()  # rebind to entirely new object
+        pass  # LINE event here should detect the rebind
+    with pytest.raises(WatchpointHit):
+        _code()
+
+
+def test_object_watch_detects_rebind_to_list_and_subsequent_mutations():
+    """watch('a') on a user-defined object, then rebinding 'a' to a list,
+    should detect both the rebind AND subsequent list mutations.
+
+    Scenario from manual testing: watch 'a' (a Thing instance), then
+    'a = [1,2,3]' rebinds it, then 'a.append(4)' mutates the list.
+    Both should fire. Currently FAILS: the class-surgery watch on the
+    original Thing doesn't monitor the local name, so the rebind is
+    missed, and after rebind the list is unwatched entirely.
+    """
+    class Thing:
+        val = 1
+
+    def _code():
+        a = Thing()
+        watch("a")
+        a = [1, 2, 3]  # rebind from Thing to list – should fire
+        pass
+    with pytest.raises(WatchpointHit):
+        _code()
+
+
+# ---------------------------------------------------------------------------
+# Edge-case coverage: global/nonlocal, generators, shadowing, asyncio
+# ---------------------------------------------------------------------------
+
+_module_var_for_global_test = 100
+
+
+def test_watch_global_variable():
+    """Watching a global variable via the `global` keyword should fire on
+    reassignment – the LINE callback resolves names via eval(name, f_globals,
+    f_locals) so globals are visible even though they aren't in f_locals.
+    """
+    global _module_var_for_global_test
+    _module_var_for_global_test = 100
+
+    def _code():
+        global _module_var_for_global_test
+        watch("_module_var_for_global_test")
+        _module_var_for_global_test = 200
+        pass
+    with pytest.raises(WatchpointHit) as exc_info:
+        _code()
+    assert exc_info.value.old_value == "100"
+    assert exc_info.value.new_value == "200"
+
+
+def test_watch_nonlocal_variable():
+    """Watching a nonlocal (closure) variable should fire on reassignment.
+    The variable lives in the enclosing frame's cell, not in f_locals of the
+    inner function – eval() resolves it correctly through the closure.
+    """
+    def _code():
+        counter = 0
+        def inner():
+            nonlocal counter
+            watch("counter")
+            counter = 1
+            pass
+        inner()
+    with pytest.raises(WatchpointHit) as exc_info:
+        _code()
+    assert exc_info.value.new_value == "1"
+
+
+def test_watch_generator_send_fires():
+    """Generator.send() rebinds a watched variable at the yield point.
+    The LINE event after resumption detects the change because the frame
+    resumes normally and LINE events keep firing.
+    """
+    def gen():
+        x = 0
+        watch("x")
+        x = yield x   # send() provides new value here
+        pass           # LINE fires here, detects x: 0 -> 42
+
+    g = gen()
+    next(g)
+    with pytest.raises((WatchpointHit, StopIteration)) as exc_info:
+        g.send(42)
+    assert isinstance(exc_info.value, WatchpointHit), "Generator send did not fire WatchpointHit"
+    assert exc_info.value.new_value == "42"
+
+
+def test_watch_variable_shadowing_independent_scopes():
+    """Watching 'x' in both outer and inner scopes – each watch is
+    frame-scoped (keyed by (name, frame_id)) and fires independently.
+    Inner fire is caught, then outer fire propagates up.
+    """
+    hits = []
+
+    def _code():
+        x = 1
+        watch("x")
+        def inner():
+            x = 10
+            watch("x")
+            x = 20
+            pass
+        try:
+            inner()
+        except WatchpointHit as h:
+            hits.append(("inner", h.old_value, h.new_value))
+        x = 2
+        pass
+
+    with pytest.raises(WatchpointHit) as exc_info:
+        _code()
+    # Inner fires first (x: 10 -> 20), then outer fires (x: 1 -> 2)
+    assert len(hits) == 1
+    assert hits[0] == ("inner", "10", "20")
+    assert exc_info.value.old_value == "1"
+    assert exc_info.value.new_value == "2"
+
+
+@pytest.mark.xfail(reason="Known limitation: asyncio coroutine frame not unwound via PY_RETURN on cancel")
+def test_asyncio_task_cancellation_cleans_up_watch():
+    """When a task is cancelled, the watched frame exits via CancelledError.
+    PY_RETURN should fire and clean up the local watch.
+
+    Currently xfail: asyncio task cancellation doesn't reliably trigger
+    PY_RETURN for the coroutine frame in all CPython versions, leaving a
+    stale entry in _local_watches. In practice this is cleaned by
+    clear_watches() on the next debug session start.
+    """
+    import asyncio
+    from watchpoint import _registry
+
+    async def watched_coro():
+        x = 1
+        watch("x")
+        await asyncio.sleep(10)
+        x = 2  # never reached
+
+    async def main():
+        task = asyncio.create_task(watched_coro())
+        await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(main())
+    assert len(_registry._local_watches) == 0, "Watch leaked after task cancellation"

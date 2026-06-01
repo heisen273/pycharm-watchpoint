@@ -223,6 +223,14 @@ class WatchpointRegistry:
                     self._remove_attr_watch_locked(expr)
                 try:
                     self._add_object_watch(expr, value)
+                    # Also install a local-variable watch so that rebinding
+                    # the name to a different object is detected. The object
+                    # watch tracks attribute mutations; the local watch tracks
+                    # identity changes (id-based hash differs on rebind).
+                    fid = id(frame)
+                    if (expr, fid) in self._local_watches:
+                        self._remove_local_watch_locked((expr, fid))
+                    self._add_local_watch(expr, frame)
                     return
                 except TypeError:
                     # Class-surgery refused (Django Model metaclass,
@@ -1340,10 +1348,18 @@ class WatchpointRegistry:
                 if not active_watches:
                     return
 
-                current_locals = dict(frame.f_locals)
-                new_hashes = {w.name: _value_hash(current_locals.get(w.name))
+                # Resolve via eval(name, f_globals, f_locals) so global and
+                # nonlocal variables are found correctly – plain
+                # f_locals.get(name) misses them since they live in f_globals
+                # or enclosing cell vars.
+                def _resolve(name):
+                    try:
+                        return eval(name, frame.f_globals, frame.f_locals)
+                    except Exception:
+                        return None
+                new_hashes = {w.name: _value_hash(_resolve(w.name))
                               for w in active_watches}
-                new_reprs = {w.name: _safe_repr(current_locals.get(w.name))
+                new_reprs = {w.name: _safe_repr(_resolve(w.name))
                              for w in active_watches}
 
                 state = self._frame_state.get(fid)
@@ -1450,10 +1466,15 @@ class WatchpointRegistry:
                 if not state or state.get("code") is not code or state["prev_line"] is None:
                     return
 
-                current_locals = dict(frame.f_locals)
-                new_hashes = {w.name: _value_hash(current_locals.get(w.name))
+                # Resolve via eval() same as _on_line – supports globals/nonlocals.
+                def _resolve(name):
+                    try:
+                        return eval(name, frame.f_globals, frame.f_locals)
+                    except Exception:
+                        return None
+                new_hashes = {w.name: _value_hash(_resolve(w.name))
                               for w in active_watches}
-                new_reprs = {w.name: _safe_repr(current_locals.get(w.name))
+                new_reprs = {w.name: _safe_repr(_resolve(w.name))
                              for w in active_watches}
 
             # Lock released – safe to call _fire_if_changed which may block in pydevd.
@@ -4050,7 +4071,13 @@ def _value_hash(value: Any) -> int:
             return hash(repr(value))
         except Exception:
             return id(value)
-    return id(value) ^ hash(tp.__qualname__)
+    # Identity-only hash for user-defined objects. Rebinding to a different
+    # object yields a different id(); in-place mutation is NOT detected (that
+    # requires an attribute watch). We intentionally omit type().__qualname__
+    # because our own class-surgery (__class__ swap) changes the qualname of a
+    # watched object, which would cause spurious fires on the local-variable
+    # watch that tracks rebinding alongside an object watch.
+    return id(value)
 
 
 # ---------------------------------------------------------------------------
