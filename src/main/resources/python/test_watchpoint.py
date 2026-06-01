@@ -764,6 +764,63 @@ def test_back_to_back_hits_install_sequential_bps(monkeypatch):
     builtins._pycharm_consume_last_hit()
 
 
+def test_bp_installed_at_current_line_not_next_when_source_differs(monkeypatch):
+    """When source_line < user_frame.f_lineno, the bp must be placed AT f_lineno.
+
+    Regression: local-variable watches detect mutations via LINE callbacks.
+    The LINE callback fires BEFORE the next line executes, so by the time
+    _handle_hit runs, f_lineno has advanced to the line ABOUT TO execute
+    (not yet executed). The bp should pause there – not one line later.
+
+    Concrete example from user report:
+    - Line 61: `a.append(1)` – mutation detected by comparing f_locals
+    - Line 62: next line (f_lineno when _handle_hit runs) – correct pause target
+    - Line 63: one line too far – the old buggy behavior
+
+    The root cause was `_next_slot_for_code(code, f_lineno)` searching for
+    lines STRICTLY > f_lineno, skipping f_lineno itself which hadn't executed
+    yet and was the correct pause point.
+    """
+    import watchpoint
+
+    install_calls: list = []
+
+    def fake_install_bp(py_db, target_code, file, line, watch_name):
+        """Record bp install calls and return success tuple."""
+        install_calls.append((file, line, watch_name))
+        return (file, line, -hash((watch_name, file, line)) & 0x7FFFFFFF)
+
+    fake_py_db = object()
+    monkeypatch.setattr(watchpoint, "_get_pydevd_debugger", lambda: fake_py_db)
+    monkeypatch.setattr(watchpoint, "_install_bp_at", fake_install_bp)
+    monkeypatch.setattr(watchpoint, "_remove_temp_breakpoints",
+                        lambda py_db, installed: None)
+
+    reg = builtins._watchpoint_registry
+
+    # Simulate: mutation on line 61, LINE callback fires for line 62.
+    # code_lines includes 60-67 so there are valid lines in both directions.
+    fake_frame = _FakeFrame(
+        "/Users/me/project/demo.py", f_lineno=62,
+        code_lines=[60, 61, 62, 63, 64, 65, 66, 67],
+        module_name="demo",
+    )
+
+    # source_line=61, user_frame.f_lineno=62 – the common local-watch case.
+    reg._handle_hit(fake_frame, "a", "'[1]'", "'[1, 2]'", "/Users/me/project/demo.py", 61)
+
+    assert len(install_calls) >= 1, "At least one bp must be installed."
+    primary_bp_line = install_calls[0][1]
+    assert primary_bp_line == 62, (
+        f"BP must be installed at f_lineno (62) – the line about to execute – "
+        f"not at {primary_bp_line}. The mutation was on line 61; line 62 hasn't "
+        f"run yet and is the correct pause target."
+    )
+
+    # Cleanup.
+    builtins._pycharm_consume_last_hit()
+
+
 def test_concurrent_hits_reserve_distinct_bp_slots(monkeypatch):
     """Concurrent `_handle_hit` calls must not choose the same bp line.
 
@@ -5866,5 +5923,22 @@ def test_next_slot_for_code_never_returns_mutation_line_or_earlier(monkeypatch):
         f"Expected at least one bp in the caller frame (views.py). "
         f"Got: {install_calls}"
     )
+
+
+def test_watch_list_inplace_mutation_via_line_diff():
+    """In-place mutation of a watched list IS detectable because _value_hash
+    uses repr(). The LINE event after the mutation sees a different repr hash.
+    This test documents the actual behavior (which contradicts the 'silent'
+    claim in earlier docs).
+    """
+    def _code():
+        a = [1, 2]
+        watch("a")
+        a.append(3)  # in-place mutation
+        pass          # LINE event here diffs repr → should fire
+    with pytest.raises(WatchpointHit) as exc_info:
+        _code()
+    assert "[1, 2]" in exc_info.value.old_value
+    assert "[1, 2, 3]" in exc_info.value.new_value
 
 

@@ -1575,7 +1575,8 @@ class WatchpointRegistry:
         return candidate
 
     def _compute_bp_targets(self, user_frame: Any,
-                            source_line: Optional[int] = None) -> list:
+                            source_line: Optional[int] = None,
+                            source_file: Optional[str] = None) -> list:
         """Compute bp slot(s) for a hit – primary + safety-net.
 
         Returns a list of `(file, line, code_object)` tuples that
@@ -1613,8 +1614,20 @@ class WatchpointRegistry:
         if source_line is not None and source_line == user_frame.f_lineno:
             primary_line = self._next_slot_after_frame(user_frame)
         if primary_line is None:
+            # When source is in the SAME file and source_line < f_lineno,
+            # the frame has advanced past the mutation line but f_lineno
+            # hasn't executed yet – it's the correct pause target. Search
+            # from f_lineno - 1 so _next_code_line_in (which finds strictly
+            # >) can return f_lineno itself.
+            # When source_line == f_lineno (fallback from _next_slot_after_frame
+            # returning None), f_lineno already executed – search after it.
+            search_after = user_frame.f_lineno
+            if (source_line is not None
+                    and source_line < user_frame.f_lineno
+                    and source_file == user_frame.f_code.co_filename):
+                search_after = user_frame.f_lineno - 1
             primary_line = self._next_slot_for_code(
-                user_frame.f_code, user_frame.f_lineno,
+                user_frame.f_code, search_after,
             )
         if primary_line is not None:
             targets.append((
@@ -1808,7 +1821,7 @@ class WatchpointRegistry:
         # tuple. Up to TWO slots: primary at the mutation site, safety
         # at the walked-up user-code frame. Empty list ⇒ no slots
         # available anywhere (last-line-of-module corner case).
-        targets = self._compute_bp_targets(pause_anchor, source_line)
+        targets = self._compute_bp_targets(pause_anchor, source_line, source_file)
 
         # Now that we know where the bp will fire (targets[0] file), refine
         # the caller info: walk up from user_frame to find the frame that's
