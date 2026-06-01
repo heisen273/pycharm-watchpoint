@@ -25,12 +25,21 @@ Cross-version notes (3.12 / 3.13 / 3.14):
   expecting WatchpointHit must therefore wrap the monitored code in a helper.
 """
 import sys
+import os
 import builtins
 import threading
 from typing import Any, Optional, Tuple
 
 if sys.version_info < (3, 12):
     raise RuntimeError("watchpoint.py requires Python 3.12+.")
+
+# When truthy, [WATCHPOINT] lines are also printed to stderr (Debug Console).
+# Set PYCHARM_WATCHPOINT_LOG=1 to enable. The Kotlin plugin always injects
+# this when launching via "Debug with Watchpoint", so the Debug Console shows
+# output automatically during IDE sessions. Unset (default) keeps stderr clean
+# for scripts/tests that don't need the noise. All output still goes to the
+# file sink at /tmp/pythonwatchpoint.log regardless of this flag.
+_WATCHPOINT_LOG: bool = os.environ.get('PYCHARM_WATCHPOINT_LOG') == '1'
 
 _monitoring = sys.monitoring
 
@@ -1623,8 +1632,18 @@ class WatchpointRegistry:
             f = user_frame.f_back
             hops = 0
             while f is not None and hops < _MAX_FRAME_WALK_HOPS:
-                # Skip our own runtime frames.
-                if f.f_code.co_filename in _RUNTIME_FILENAMES:
+                # Skip our own runtime frames AND pydevd-internal frames.
+                # Crucially, pydevd's own files (helpers/pydev/pydevd.py etc.)
+                # must be skipped: pydevd won't pause on breakpoints installed
+                # inside its own infrastructure, so picking those as bp targets
+                # silently swallows the pause (observed on PyCharm 2025.3 when
+                # the mutation is on the last line of a function).
+                # NOTE: site-packages frames are intentionally NOT skipped here –
+                # pydevd CAN pause there via LineBreakpoint, and using a closer
+                # library frame as the intermediate gives a more contextual pause
+                # than jumping straight to the distant user-code safety net.
+                if (f.f_code.co_filename in _RUNTIME_FILENAMES
+                        or _is_pydevd_internal(f.f_code.co_filename)):
                     f = f.f_back
                     hops += 1
                     continue
@@ -2688,17 +2707,17 @@ def _safe_repr(value: Any) -> str:
         return "<unprintable>"
 
 
-def _log_warn(msg: str) -> None:
+def _log_warn(msg: str, *, always: bool = False) -> None:
     """Write a one-line `[WATCHPOINT]` warning to stderr AND tee to a
     diagnostic file, never raise.
 
-    Why the file tee: under pytest the default capture mode hides stderr,
-    so `[WATCHPOINT]` lines never reach the user's terminal or Debug
-    Console tab. Under sys.monitoring + pydevd's stdout/stderr
-    interception some lines also get rewritten or dropped. The file
-    sink at `/tmp/pythonwatchpoint.log` is the durable fallback the user
-    can `tail -f` during a debug session, regardless of capture
-    configuration.
+    Stderr output is gated on `_WATCHPOINT_LOG` (i.e. `PYCHARM_WATCHPOINT_LOG=1`),
+    UNLESS `always=True` is passed – use that for critical startup lines that
+    should be visible regardless of the env flag (e.g. "runtime loaded").
+    The file sink at `/tmp/pythonwatchpoint.log` is always written regardless
+    of either flag – it is the durable fallback the user can `tail -f` under
+    pytest (which hides stderr by default) or when pydevd's stdout interception
+    drops lines.
 
     File path is fixed (not env-driven) on purpose: when the user is
     reporting a bug, "just look at /tmp/pythonwatchpoint.log" is one
@@ -2707,10 +2726,11 @@ def _log_warn(msg: str) -> None:
     sessions (we trim to the last ~1 MB when we cross 2 MB).
     """
     line = f"[WATCHPOINT] {msg}"
-    try:
-        print(line, file=sys.stderr, flush=True)
-    except Exception:
-        pass
+    if always or _WATCHPOINT_LOG:
+        try:
+            print(line, file=sys.stderr, flush=True)
+        except Exception:
+            pass
     try:
         import os as _os
         path = "/tmp/pythonwatchpoint.log"
@@ -3039,7 +3059,25 @@ except Exception:
 # a bug we can confirm from /tmp/pythonwatchpoint.log which version of
 # the runtime is actually loaded in their session – distinguishing
 # "my fix didn't help" from "you're running an older bundled copy."
-_RUNTIME_VERSION = "2026-05-31-loop-back-bp-target-v24"
+_RUNTIME_VERSION = "2026-06-01-pydevd-internal-filter-v26"
+
+
+def _is_pydevd_internal(filename: str) -> bool:
+    """True if *filename* belongs to PyCharm's pydevd / debugger-helper infrastructure.
+
+    PyDevD will NOT pause on `LineBreakpoint`s installed inside its own code, so these
+    frames must be filtered out when searching for a bp target in `_compute_bp_targets`.
+    The substrings cover all known PyCharm versions regardless of install location or OS.
+
+    Note: this is intentionally narrower than `_is_library_filename`. Third-party
+    site-packages frames ARE valid bp targets (pydevd pauses there fine); only
+    pydevd's own infrastructure silently drops the pause.
+    """
+    return (
+        "helpers/pydev" in filename
+        or "pydevd_bundle" in filename
+        or "_pydev_bundle" in filename
+    )
 
 
 def _is_library_filename(path: str) -> bool:
@@ -3089,7 +3127,11 @@ def _is_library_filename(path: str) -> bool:
         return True
     if _STDLIB_DIR_PREFIX is not None and path.startswith(_STDLIB_DIR_PREFIX):
         return True
-    return False
+    # IDE/debugger infrastructure – pydevd's own helpers live under the
+    # PyCharm app bundle (e.g. helpers/pydev/pydevd.py). Including them here
+    # ensures `_find_user_code_caller` (used for safety-net bp targets) skips
+    # past pydevd frames and lands on actual user code.
+    return _is_pydevd_internal(path)
 
 
 def _find_user_code_caller(start_frame: Any) -> Any:
@@ -4321,7 +4363,4 @@ builtins._pycharm_consume_last_hit = _pycharm_consume_last_hit
 # Also surfaces `_STDLIB_DIR_PREFIX` so we can confirm the stdlib filter
 # is using the right path for THIS Python install (uv-managed Pythons
 # sit under custom roots that we want to confirm are detected).
-_log_warn(
-    f"runtime loaded: version={_RUNTIME_VERSION} "
-    f"stdlib_prefix={_STDLIB_DIR_PREFIX!r}"
-)
+_log_warn("runtime loaded", always=True)
