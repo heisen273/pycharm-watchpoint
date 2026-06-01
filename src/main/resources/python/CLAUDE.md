@@ -27,6 +27,8 @@ clear_watches()              # remove all
 # Plugin-side entry points on builtins:
 builtins._pycharm_watch          # alias of watch
 builtins._pycharm_watch_at       # name, file_hint, func_hint – locates the paused user frame
+                                 # returns str(id(frame)) on success so the IDE can key
+                                 # the highlight to the exact frame instance
 builtins._pycharm_unwatch
 builtins._pycharm_clear_watches
 builtins._pycharm_watchpoint_diag  # diagnostic about pydevd lookup
@@ -114,7 +116,7 @@ Each hit installs its OWN pydevd `LineBreakpoint` at a successive code line via 
 - **Primary**: next future code line in `user_frame.f_code`. Uses `frame.f_lasti` + `dis.get_instructions` for multi-line statements where numeric source order points into already-executed RHS lines. When no forward line exists but a `JUMP_BACKWARD` is present (tight loop), the loop header is used as bp target via `_offset_to_line(code, jump_target)` (v24 fix).
 - **Safety**: next code line in `_find_user_code_caller`'s walked-up frame.
 
-When primary is exhausted AND no loop-back is available, the f_back walk finds the nearest caller frame with a valid next line (skipping only our runtime frames).
+When primary is exhausted AND no loop-back is available, the f_back walk finds the nearest caller frame with a valid next line, **skipping only our own runtime frames and pydevd-internal frames** (`helpers/pydev`, `pydevd_bundle`, `_pydev_bundle`). Site-packages frames are intentionally left in – pydevd CAN pause there via LineBreakpoint, and using the closest library caller is more contextual than jumping to a distant user-code frame.
 
 `_pycharm_consume_last_hit(pause_file, pause_line)` drains the hit whose bp location matches the current pause. ALL bps for drained hits are removed (including unfired siblings).
 
@@ -145,9 +147,12 @@ Pipeline:
 ### §15 `_wp_container_repr` must swallow repr errors
 All 33 mutating-method snapshot calls go through `_wp_container_repr(self)` which wraps `list.__repr__` / `dict.__repr__` / `set.__repr__` in try/except, returning `"<unreprable>"` on any error. Without this, `deepcopy` into a `_WatchedDict` raises when a half-constructed Django Model's `__repr__` touches uninitialized `_state`.
 
-### §16 Runtime fingerprint + file log
-- `_RUNTIME_VERSION` string logged at module load. Bump on every meaningful behavioral change. Lets you distinguish "fix didn't help" from "stale build."
-- `_log_warn` tees to `/tmp/pythonwatchpoint.log` (fixed path, append-mode, truncated at 2 MB → 1 MB). Durable across pytest capture and pydevd stdout interception.
+### §16 Runtime fingerprint + file log + stderr gate
+
+- `_RUNTIME_VERSION` string logged at module load via `_log_warn("runtime loaded", always=True)`. Bump on every meaningful behavioral change. Lets you distinguish "fix didn't help" from "stale build."
+- `_log_warn(msg, *, always=False)` tees to `/tmp/pythonwatchpoint.log` (fixed path, append-mode, truncated at 2 MB → 1 MB). Durable across pytest capture and pydevd stdout interception.
+- **Stderr gate**: `_log_warn` only prints to stderr when `_WATCHPOINT_LOG` is `True` OR `always=True`. `_WATCHPOINT_LOG` is set from the `PYCHARM_WATCHPOINT_LOG=1` env var at module load. The Kotlin plugin does NOT inject this automatically – set it manually in your run config to see verbose output in the Debug Console. The startup "runtime loaded" and sitecustomize "Loaded in process" messages bypass the gate (`always=True` / unconditional) so they always appear.
+- **Tests**: `conftest.py` sets `watchpoint._WATCHPOINT_LOG = True` in `pytest_sessionstart` so all `capsys`-based log assertions work regardless of the env var.
 
 ### §17 Direct-pause dispatch via `_bp_pause_pending`
 Belt-and-suspenders: after `consolidate_breakpoints`, also register `(id(target_code), line)` in `_bp_pause_pending` and arm the same events under our own `_TOOL_ID`. Our `_on_line` fires this path independently when pydevd's `py_line_callback` doesn't fire (prior `DISABLE` decision). Pops before dispatch (no double-fire). Cleared on drain and `clear_watches()`.
@@ -222,9 +227,12 @@ info.pydev_step_stop = user_frame
 | `_bp_pause_pending` | `{(id(code), line): True}` – direct-pause dispatch (§17). |
 | `_temp_breakpoints` | `[(file, line, bp_id)]` – cleaned up on every sessionPaused. |
 | `_installing_watch_thread` | Side-effect suppression during tree walk (§18). |
-| `_FRAMEWORK_MODULE_ROOTS` | Frozenset of module roots to skip during recursion (django, sqlalchemy, pydevd, ...). |
+| `_FRAMEWORK_MODULE_ROOTS` | Frozenset of module roots to skip during recursion. Expanded to include: django, sqlalchemy, pydevd, celery, kombu, redis, pymongo, boto3/botocore, grpc, sentry_sdk, loguru, uvicorn, gunicorn, pytest, setuptools, and others. |
 | `_is_user_defined_type` | Returns True iff type is from user code (not builtins/stdlib/framework/site-packages). |
-| `_is_library_filename` | True for site-packages / dist-packages / stdlib paths. Overridable via `PYCHARM_WATCHPOINT_USER_ROOTS`. |
+| `_is_library_filename` | True for site-packages / dist-packages / stdlib / pydevd-internal paths. Overridable via `PYCHARM_WATCHPOINT_USER_ROOTS`. |
+| `_is_pydevd_internal` | True for PyCharm's pydevd infrastructure paths (`helpers/pydev`, `pydevd_bundle`, `_pydev_bundle`). Narrower than `_is_library_filename` – used specifically in the f_back walk of `_compute_bp_targets` to skip frames where pydevd won't pause. |
+| `_WATCHPOINT_LOG` | Module-level bool; True when `PYCHARM_WATCHPOINT_LOG=1`. Gates `_log_warn` stderr output. |
+| `_log_warn` | `_log_warn(msg, *, always=False)` – tees to stderr (if `_WATCHPOINT_LOG or always`) and `/tmp/pythonwatchpoint.log` always. |
 | `_RUNTIME_VERSION` | Version string – bump on every behavioral change; logged at import. |
 
 ## Anti-patterns – DON'T do these
@@ -262,7 +270,8 @@ info.pydev_step_stop = user_frame
 - **DON'T** use a simple bool for `_installing_watch_thread`. Thread-scoped so other threads still fire during installation.
 - **DON'T** clean up `_bp_pause_pending` lazily ("let them die in `_on_line`"). Stale entries would spuriously trigger direct-pause for future executions of the same code+line.
 - **DON'T** coalesce bulk mutations from the same source line into one queued hit. Users want N pauses for N mutations, not 1 coalesced stop. The loop-back bp target (v24) solves the tight-loop case properly.
-- **DON'T** filter library frames in the f_back walk of `_compute_bp_targets`. It pushes bps to distant frames that fire late, scrambling hit ordering in Django middleware stacks. The f_back walk must find the NEAREST frame (skipping only runtime frames), not the nearest user-code frame. Tried and reverted (v24).
+- **DON'T filter all library frames in the f_back walk of `_compute_bp_targets`.** Site-packages frames are valid bp targets – pydevd CAN pause there via LineBreakpoint. Filtering them pushes bps to distant frames that fire late, scrambling hit ordering in Django middleware stacks. Tried and reverted (v24).
+  - **DO** filter **pydevd-internal** frames specifically (`_is_pydevd_internal`). PyDevD won't pause on breakpoints installed inside its own infrastructure (`helpers/pydev/pydevd.py` etc.), so those frames must be skipped or the pause is silently swallowed (observed on PyCharm 2025.3 when mutation is on the last line of a function).
 
 ## Known limitations (each pinned by a test – don't "fix" without reading the rationale)
 

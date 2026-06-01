@@ -19,9 +19,11 @@
 
 `build.gradle.kts`:
 - `org.jetbrains.kotlin.jvm` **2.2.0** + `org.jetbrains.intellij.platform` **2.16.0**
-- Target: `pycharmCommunity("2025.1")` + `bundledPlugin("PythonCore")`
-- Source / target: **Java 21**, Kotlin toolchain with JBR vendor
-- `sinceBuild = "243"`, `untilBuild = "261.*"` – keep in sync with tested PyCharm version
+- Target: `pycharmCommunity("2023.3")` + `bundledPlugin("PythonCore")`
+- Source / target: **Java 17** bytecode (`tasks.withType<KotlinCompile>` + `tasks.withType<JavaCompile>` with `options.release.set(17)`), Kotlin toolchain still JBR 21.
+  - `jvmToolchain(21)` overrides the `kotlin { compilerOptions }` block and the `java { targetCompatibility }` extension in KGP 2.x – the only reliable override is configuring both compile tasks directly.
+  - Java 17 class files (version 61.0) load in PyCharm 2023.x (JBR 17) through 2026.x (JBR 21). Do **not** raise to 21 – breaks older sandboxes.
+- `sinceBuild = "231"`, `untilBuild = "261.*"` – keep in sync with tested PyCharm version
 
 ## Long-running daemon trap
 
@@ -144,6 +146,26 @@ variablesView.processSessionEvent(XDebugView.SessionEvent.FRAME_CHANGED, session
 
 Call inside `invokeLater { ... }`.
 
+`getVariablesView()` is `@ApiStatus.Internal` and was added after 2024.3 – call it **reflectively** so the plugin compiles on 2023.x. `getSessionTab()` is also `@Internal` but exists on all target builds. Pattern:
+
+```kotlin
+@Suppress("UnstableApiUsage")
+private fun refreshVariablesView(project: Project) {
+    val session = XDebuggerManager.getInstance(project).currentSession as? XDebugSessionImpl ?: return
+    val refreshed = runCatching {
+        val sessionTab = session.sessionTab ?: return@runCatching false
+        val view = sessionTab.javaClass.getMethod("getVariablesView").invoke(sessionTab)
+            ?: return@runCatching false
+        view.javaClass.getMethod("processSessionEvent",
+            XDebugView.SessionEvent::class.java,
+            com.intellij.xdebugger.XDebugSession::class.java)
+            .invoke(view, XDebugView.SessionEvent.FRAME_CHANGED, session)
+        true
+    }.getOrDefault(false)
+    if (!refreshed) session.rebuildViews()  // fallback on 2023.x
+}
+```
+
 ### Mutating a RangeHighlighter
 
 `RangeHighlighter` has the getter but not the setter. The setter is on `RangeHighlighterEx`:
@@ -156,6 +178,37 @@ import com.intellij.openapi.editor.ex.RangeHighlighterEx
 ### Alarm deprecation
 
 No-arg `Alarm()` is deprecated in 2025.1. Use `Alarm(project)` so the alarm is cleaned up automatically when the project closes.
+
+### WatchpointMarkerService – frame-scoped keys
+
+Watches are stored as `WatchKey(expression: String, frameId: Long)` where `frameId` is the Python `id(frame)` returned by `watch_at()`. This prevents a watch on `"self"` from lighting up every row named `"self"` across all threads and stack frames.
+
+`add(expression, frameId)` – arm.  
+`remove(expression)` – disarm (by expression only; frameId not needed on remove).  
+`isWatched(expression, frameId)` – exact match.  
+`isWatched(expression)` – name-only fallback for rebind-only watches where the frame id has changed.
+
+The `WatchpointTreeCellRenderer` and `AddWatchpointAction.update()` use a three-pronged check:
+1. Frame-scoped marker (`isWatched(path, frameId)`) – exact frame.
+2. Name-only fallback (`isWatched(path)`) – Django model rebind-only watches.
+3. Type-sniff on `PyDebugValue.type.startsWith("_Watched")` – class-surgery watches travelling through middleware frames.
+
+### Stale WatchpointHit breakpoint cleanup
+
+`addWatchpointHitBreakpoint` in `WatchpointDebugListener` sweeps for any persisted `WatchpointHit` breakpoints from crashed sessions or older plugin versions (old name was `watchpoint.WatchpointHit` without the underscore prefix) before registering the new one:
+
+```kotlin
+val existing = manager.getBreakpoints(type)
+for (bp in existing.toList()) {
+    if ("WatchpointHit" in (bp.properties?.exception ?: "")) {
+        manager.removeBreakpoint(bp)
+    }
+}
+```
+
+### Notifications – reflection required on 2023.x
+
+`com.intellij.notification` may not be on the compile classpath when building against 2023.x SDKs under Gradle IntelliJ Platform plugin 2.x. All notification calls go through `notifyError(project, message)` which resolves `NotificationGroupManager` and `NotificationType` fully via `Class.forName` + reflection at runtime. Falls back to `logger.warn()` on any exception.
 
 ### Exception-breakpoint API
 
@@ -226,9 +279,9 @@ On every `sessionPaused`, queries `_pycharm_consume_last_hit()` – returns base
 
 ## Variables-panel highlighting
 
-`WatchpointMarkerService` – project-scoped service holding armed watch expressions (full dotted paths). Cleared on `processStarted` to prevent ghost-highlighting from previous sessions.
+`WatchpointMarkerService` – project-scoped service holding armed watch expressions keyed by `(expression, frameId)`. Cleared on `processStarted` to prevent ghost-highlighting from previous sessions.
 
-`WatchpointTreeCellRenderer` – wraps the default renderer. Installed lazily on first watch arm (idempotent via instanceof check). For each cell, computes the row's full dotted path and if it's in the service:
+`WatchpointTreeCellRenderer` – wraps the default renderer. Installed lazily on first watch arm (idempotent via instanceof check). For each cell, computes the row's full dotted path and checks via the three-pronged `isWatched` logic (frame-scoped → name-only → type-sniff); if matched:
 - Swaps icon to `WatchpointIcons.Watch` (always, even on selected rows).
 - Tints background pale yellow – **only when NOT selected** (selection colour wins on selected rows).
 
@@ -290,7 +343,7 @@ If `./gradlew runIde` doesn't pick up changes, run `./gradlew clean` first. Chec
 ## Known rough edges
 
 - Long debug sessions accumulate `_local_watches` / `_attr_watches` entries for unwatched objects. No auto-cleanup yet.
-- `NotificationGroupManager.getNotificationGroup("Debugger messages")` – if PyCharm renames this group, notifications fail silently.
+- `NotificationGroupManager.getNotificationGroup("Debugger messages")` – called via **reflection** (`notifyError()`) so the plugin compiles on 2023.x where `com.intellij.notification` may be absent from the Gradle classpath. Falls back to `logger.warn()` if reflection fails.
 - No Kotlin-side tests yet. `intellijPlatform.testFramework(TestFrameworkType.Platform)` is wired in `build.gradle.kts`; tests go under `src/test/kotlin/`.
 - `WatchpointHitHighlighter` skips (rather than clamps) when hit line exceeds the file's current line count.
 - `WatchpointSessionManager.consumeWatchpointCode()` uses `AtomicReference.getAndSet(null)` for atomicity across concurrent session launches.
