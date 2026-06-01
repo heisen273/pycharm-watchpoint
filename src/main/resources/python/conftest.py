@@ -11,6 +11,9 @@ import pytest
 def pytest_sessionstart(session) -> None:
     """Boot the watchpoint monitoring at the start of the test session."""
     import watchpoint  # noqa: F401 – side-effect: registers sys.monitoring callbacks
+    # Enable stderr output for all tests so capsys-based assertions can catch
+    # [WATCHPOINT] lines. In production, this is controlled by PYCHARM_WATCHPOINT_LOG.
+    watchpoint._WATCHPOINT_LOG = True
 
 
 @pytest.fixture(autouse=True)
