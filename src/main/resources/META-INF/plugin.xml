@@ -24,9 +24,14 @@
         watch something – even in very large codebases.
     ]]></description>
 
-    <!-- This single dependency gates the plugin to PyCharm and causes the
-         Marketplace / IDE to refuse installation on IDEA, CLion, etc. -->
+    <!-- com.intellij.modules.pycharm gates installation to PyCharm only –
+         IDEA + Python plugin has com.intellij.modules.python but NOT pycharm,
+         so the Marketplace / IDE refuses installation on non-PyCharm IDEs.
+         com.intellij.modules.python is still required: it makes the Python
+         plugin's classloader a parent of ours, giving access to
+         AbstractPythonRunConfiguration and all other Python API classes. -->
     <depends>com.intellij.modules.pycharm</depends>
+    <depends>com.intellij.modules.python</depends>
 
     <extensions defaultExtensionNs="com.intellij">
         <projectService serviceImplementation="com.pythonwatchpoint.services.WatchpointSessionManager"/>
