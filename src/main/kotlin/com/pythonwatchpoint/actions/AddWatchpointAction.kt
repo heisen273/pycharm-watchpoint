@@ -281,10 +281,23 @@ class AddWatchpointAction : AnAction() {
      * call them via reflection so the plugin compiles and runs on the full
      * 2024–2026 range. Falls back to `rebuildViews()` on builds where either
      * method is absent (the frame-reset side-effect is acceptable vs. stale icons).
+     *
+     * In PyCharm 2025.2+ "split debugger" (FE proxy) mode, calling `getSessionTab()`
+     * triggers a `Logger.error` inside XDebugSessionImpl that surfaces as a
+     * user-visible error balloon even though the method still returns a value.
+     * We detect split mode up-front via [isSplitDebuggerMode] and skip straight
+     * to `rebuildViews()` in that case, avoiding the error entirely.
      */
     @Suppress("UnstableApiUsage")
     private fun refreshVariablesView(project: Project) {
         val session = XDebuggerManager.getInstance(project).currentSession as? XDebugSessionImpl ?: return
+
+        // In split/FE-proxy mode getSessionTab() logs an error before returning –
+        // skip the sessionTab path entirely and fall straight to rebuildViews().
+        if (isSplitDebuggerMode()) {
+            session.rebuildViews()
+            return
+        }
 
         val refreshed = runCatching {
             // Step 1: sessionTab – exists on all target builds but is @Internal.
@@ -311,6 +324,35 @@ class AddWatchpointAction : AnAction() {
             // but keeps variable icons up-to-date on older builds.
             session.rebuildViews()
         }
+    }
+
+    /**
+     * Returns true when PyCharm's "split debugger" mode is active, meaning
+     * [XDebugSessionImpl.getSessionTab] would fire a [Logger.error] before
+     * returning – producing a user-visible error balloon.
+     *
+     * The gate changed between platform versions:
+     *  - 2025.2: `XDebugSessionProxy.Companion.useFeProxy()` (class introduced then)
+     *  - 2026.1: `SplitDebuggerMode.isSplitDebugger()` (new dedicated class)
+     *
+     * We try the 2026.1 API first; if the class doesn't exist we fall back to
+     * the 2025.2 API. Returns false on any reflection failure so the existing
+     * sessionTab path is used on older builds where split mode doesn't exist.
+     */
+    private fun isSplitDebuggerMode(): Boolean {
+        // 2026.1+: com.intellij.xdebugger.SplitDebuggerMode.isSplitDebugger()
+        runCatching {
+            val cls = Class.forName("com.intellij.xdebugger.SplitDebuggerMode")
+            return cls.getMethod("isSplitDebugger").invoke(null) as? Boolean ?: false
+        }
+        // 2025.2: XDebugSessionProxy.Companion.useFeProxy()
+        return runCatching {
+            val proxyClass = Class.forName("com.intellij.xdebugger.impl.frame.XDebugSessionProxy")
+            val companionField = proxyClass.getDeclaredField("Companion")
+            companionField.isAccessible = true
+            val companion = companionField.get(null)
+            companion.javaClass.getMethod("useFeProxy").invoke(companion) as? Boolean ?: false
+        }.getOrDefault(false)
     }
 
     /**

@@ -144,6 +144,31 @@ variablesView.processSessionEvent(XDebugView.SessionEvent.FRAME_CHANGED, session
 
 **Do NOT use `session.rebuildViews()`** – it dispatches `FRAME_CHANGED` to ALL debug views including the Frames panel, which resets the selected stack frame to the topmost one, discarding the user's scroll position.
 
+**Split-debugger mode (2025.2+):** `getSessionTab()` and `getRunContentDescriptor()` both call `Logger.error()` when split mode is active, producing a user-visible error balloon even though they still return their values. Pre-check split mode before calling either method. The API to detect split mode **changed between versions**:
+
+- 2025.2: `XDebugSessionProxy.Companion.useFeProxy()` (no `SplitDebuggerMode` class yet)  
+- 2026.1: `SplitDebuggerMode.isSplitDebugger()` (new dedicated class in `com.intellij.xdebugger`)
+
+```kotlin
+private fun isSplitDebuggerMode(): Boolean {
+    // 2026.1+: dedicated class
+    runCatching {
+        val cls = Class.forName("com.intellij.xdebugger.SplitDebuggerMode")
+        return cls.getMethod("isSplitDebugger").invoke(null) as? Boolean ?: false
+    }
+    // 2025.2 fallback: XDebugSessionProxy companion
+    return runCatching {
+        val proxyClass = Class.forName("com.intellij.xdebugger.impl.frame.XDebugSessionProxy")
+        val companionField = proxyClass.getDeclaredField("Companion")
+        companionField.isAccessible = true
+        val companion = companionField.get(null)
+        companion.javaClass.getMethod("useFeProxy").invoke(companion) as? Boolean ?: false
+    }.getOrDefault(false)
+}
+```
+
+Falls back to `false` on older builds where neither class exists. When `isSplitDebuggerMode()` returns true, skip the `sessionTab` path and call `session.rebuildViews()` directly. Note: `PyDebugRunner.execute()` (PyCharm's own code) also calls `getRunContentDescriptor()` internally – that split-mode error comes from PyCharm itself and cannot be suppressed by the plugin.
+
 Call inside `invokeLater { ... }`.
 
 `getVariablesView()` is `@ApiStatus.Internal` and was added after 2024.3 – call it **reflectively** so the plugin compiles on 2023.x. `getSessionTab()` is also `@Internal` but exists on all target builds. Pattern:
