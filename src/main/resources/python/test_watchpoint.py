@@ -18,9 +18,12 @@ so change detection fires one line AFTER the assignment. The helper
 function includes a `pass` sentinel after each assignment to give the
 LINE callback a chance to fire and raise.
 """
+import gc
 import inspect
 import pytest
 import builtins
+import weakref
+
 
 from watchpoint import watch, unwatch, clear_watches, WatchpointHit
 
@@ -6105,3 +6108,241 @@ def test_asyncio_task_cancellation_cleans_up_watch():
 
     asyncio.run(main())
     assert len(_registry._local_watches) == 0, "Watch leaked after task cancellation"
+
+
+def test_object_watch_does_not_prevent_gc():
+    """Object watches use weakrefs for obj_ref so the watched object can be
+    garbage-collected when user code drops all references. After unwatch(),
+    nothing in the registry should keep the object alive.
+    """
+    import weakref as _weakref
+
+    class Trackable:
+        val = 1
+
+    obj = Trackable()
+    ref = _weakref.ref(obj)
+    watch("obj")
+    # The watch is armed. Now unwatch – this should release the registry's
+    # reference to obj. Previously obj_ref was a strong reference and would
+    # keep obj alive even after unwatch() dropped the _attr_watches entry.
+    unwatch("obj")
+    del obj
+    gc.collect()
+    assert ref() is None, "Watched object leaked – registry holds strong ref after unwatch"
+
+
+def test_object_watch_gc_while_armed():
+    """While a watch IS still armed, the registry should NOT prevent GC of the
+    watched object (weakref for obj_ref). The _attr_watches entry may remain
+    (stale), but it won't pin the object in memory.
+
+    We test this by arming the watch inside a helper frame so the local-variable
+    watch gets cleaned by PY_RETURN, leaving only the object-watch entry.
+    """
+    import weakref as _weakref
+    from watchpoint import _registry
+
+    class Trackable:
+        val = 1
+
+    holder = [Trackable()]
+    ref = _weakref.ref(holder[0])
+
+    def _arm():
+        """Arm the watch inside a helper so the local `obj` dies with the frame."""
+        obj = holder[0]
+        watch("obj")
+
+    try:
+        _arm()
+    except WatchpointHit:
+        pass  # PY_RETURN diff might fire – ignore
+
+    # The local watch was cleaned by PY_RETURN. The object watch entry in
+    # _attr_watches holds a weakref to holder[0].
+    holder.clear()
+    gc.collect()
+    assert ref() is None, (
+        "Watched object stayed alive via registry strong ref – weakref not working"
+    )
+    # Cleanup
+    unwatch("obj")
+
+
+def test_watch_property_setter_fires():
+    """Watching 'obj.v' where v is a @property must detect assignment via
+    the property setter.
+    """
+    class WithProp:
+        def __init__(self):
+            self._v = 0
+        @property
+        def v(self):
+            return self._v
+        @v.setter
+        def v(self, val):
+            self._v = val
+
+    obj = WithProp()
+    watch("obj.v")
+    with pytest.raises(WatchpointHit) as exc_info:
+        obj.v = 42
+    assert exc_info.value.new_value == "42"
+
+
+# ---------------------------------------------------------------------------
+# Issue #4: _fire_if_changed exception must not disable monitoring permanently
+# ---------------------------------------------------------------------------
+
+def test_on_line_swallows_non_watchpointhit_exceptions():
+    """If _fire_if_changed raises a non-WatchpointHit exception (e.g. from a
+    broken pydevd or corrupt state), _on_line must swallow it so sys.monitoring
+    doesn't permanently DISABLE LINE events for that code object.
+
+    After the swallowed exception, subsequent changes to the watched variable
+    should still fire – proving LINE events weren't disabled.
+    """
+    from unittest.mock import patch
+    from watchpoint import _registry
+
+    call_count = [0]
+
+    original_handle_hit = _registry._handle_hit
+
+    def _exploding_handle_hit(*args, **kwargs):
+        """First call raises RuntimeError (simulates pydevd crash), second
+        call raises WatchpointHit normally."""
+        call_count[0] += 1
+        if call_count[0] == 1:
+            raise RuntimeError("Simulated pydevd internal error")
+        return original_handle_hit(*args, **kwargs)
+
+    def _code():
+        x = 1
+        watch("x")
+        x = 2    # first change – _handle_hit raises RuntimeError (swallowed)
+        pass
+        x = 3    # second change – should still fire (LINE not disabled)
+        pass
+
+    with patch.object(_registry, '_handle_hit', _exploding_handle_hit):
+        with pytest.raises(WatchpointHit) as exc_info:
+            _code()
+
+    # The second change DID fire, proving monitoring wasn't disabled
+    assert exc_info.value.new_value == "3"
+    assert call_count[0] == 2, (
+        f"Expected _handle_hit called twice, got {call_count[0]} – "
+        f"LINE events may have been disabled after first exception"
+    )
+
+
+def test_watchpointhit_still_propagates_from_on_line():
+    """WatchpointHit (the intentional no-pydevd raise) must NOT be swallowed –
+    it should propagate out of _on_line so tests and standalone usage still work.
+    """
+    def _code():
+        x = 1
+        watch("x")
+        x = 2
+        pass
+    with pytest.raises(WatchpointHit):
+        _code()
+
+
+# ---------------------------------------------------------------------------
+# Issue #2: _trigger_direct_pause double-suspend guard
+# ---------------------------------------------------------------------------
+
+def test_trigger_direct_pause_skips_already_suspended_thread():
+    """If the thread is already in STATE_SUSPEND (pydev_state == 2),
+    _trigger_direct_pause must skip the do_wait_suspend call to avoid
+    crashing pydevd's protocol layer with a double-suspend.
+
+    We mock pydevd to simulate the already-suspended condition and verify
+    that do_wait_suspend is NOT called.
+    """
+    import sys
+    import types
+    import threading
+    from unittest.mock import MagicMock, patch
+    from watchpoint import _registry
+
+    # Provide a fake _pydevd_bundle.pydevd_comm_constants module so the
+    # import inside _trigger_direct_pause succeeds.
+    fake_constants = types.ModuleType("_pydevd_bundle.pydevd_comm_constants")
+    fake_constants.CMD_SET_BREAK = 111
+    fake_bundle = types.ModuleType("_pydevd_bundle")
+
+    mock_py_db = MagicMock()
+    mock_py_db._finish_debugging_session = False
+
+    # Simulate already-suspended: pydevd stores state on thread.additional_info
+    current_thread = threading.current_thread()
+    mock_info = MagicMock()
+    mock_info.pydev_state = 2  # STATE_SUSPEND
+    original_info = getattr(current_thread, 'additional_info', None)
+    current_thread.additional_info = mock_info
+
+    try:
+        with patch.dict(sys.modules, {
+            "_pydevd_bundle": fake_bundle,
+            "_pydevd_bundle.pydevd_comm_constants": fake_constants,
+        }):
+            with patch('watchpoint._get_pydevd_debugger', return_value=mock_py_db):
+                _registry._trigger_direct_pause(None, 1)
+    finally:
+        # Restore original state
+        if original_info is None:
+            if hasattr(current_thread, 'additional_info'):
+                del current_thread.additional_info
+        else:
+            current_thread.additional_info = original_info
+
+    # do_wait_suspend must NOT have been called
+    mock_py_db.do_wait_suspend.assert_not_called()
+
+
+def test_trigger_direct_pause_proceeds_when_not_suspended():
+    """When thread is NOT already suspended (pydev_state != 2),
+    _trigger_direct_pause should call set_suspend + do_wait_suspend.
+    """
+    import sys
+    import types
+    import threading
+    from unittest.mock import MagicMock, patch
+    from watchpoint import _registry
+
+    fake_constants = types.ModuleType("_pydevd_bundle.pydevd_comm_constants")
+    fake_constants.CMD_SET_BREAK = 111
+    fake_bundle = types.ModuleType("_pydevd_bundle")
+
+    mock_py_db = MagicMock()
+    mock_py_db._finish_debugging_session = False
+
+    # Simulate NOT suspended: pydev_state = 1 (STATE_RUN)
+    current_thread = threading.current_thread()
+    mock_info = MagicMock()
+    mock_info.pydev_state = 1  # STATE_RUN
+    original_info = getattr(current_thread, 'additional_info', None)
+    current_thread.additional_info = mock_info
+
+    try:
+        with patch.dict(sys.modules, {
+            "_pydevd_bundle": fake_bundle,
+            "_pydevd_bundle.pydevd_comm_constants": fake_constants,
+        }):
+            with patch('watchpoint._get_pydevd_debugger', return_value=mock_py_db):
+                _registry._trigger_direct_pause(None, 1)
+    finally:
+        if original_info is None:
+            if hasattr(current_thread, 'additional_info'):
+                del current_thread.additional_info
+        else:
+            current_thread.additional_info = original_info
+
+    # Both set_suspend and do_wait_suspend should have been called
+    mock_py_db.set_suspend.assert_called_once()
+    mock_py_db.do_wait_suspend.assert_called_once()
+

@@ -28,6 +28,7 @@ import sys
 import os
 import builtins
 import threading
+import weakref
 from typing import Any, Optional, Tuple
 
 if sys.version_info < (3, 12):
@@ -42,6 +43,26 @@ if sys.version_info < (3, 12):
 _WATCHPOINT_LOG: bool = os.environ.get('PYCHARM_WATCHPOINT_LOG') == '1'
 
 _monitoring = sys.monitoring
+
+
+# Sentinel for weak-ref dereference when referent is dead.
+_DEAD = object()
+
+
+def _make_weak_or_strong(obj):
+    """Return a callable that yields `obj` when called – weakref.ref if the
+    object supports it, otherwise a strong-ref lambda. Returns None-returning
+    callable if obj is None.
+    """
+    if obj is None:
+        return lambda: None
+    try:
+        return weakref.ref(obj)
+    except TypeError:
+        # Objects that don't support weakref (e.g. some C-extension instances,
+        # or objects with __slots__ but no __weakref__ slot). Fall back to a
+        # strong reference wrapped in a callable for uniform access.
+        return lambda: obj
 
 
 # ---------------------------------------------------------------------------
@@ -1384,10 +1405,27 @@ class WatchpointRegistry:
 
             # Lock released – safe to enter pydevd which may block.
             if prev_line is not None:
-                self._fire_if_changed(
-                    frame, active_watches, prev_line, prev_hashes, prev_reprs,
-                    new_hashes, new_reprs, code.co_filename,
-                )
+                try:
+                    self._fire_if_changed(
+                        frame, active_watches, prev_line, prev_hashes, prev_reprs,
+                        new_hashes, new_reprs, code.co_filename,
+                    )
+                except WatchpointHit:
+                    # Intentional raise for no-pydevd/test mode – let it
+                    # propagate. sys.monitoring treats this as a user-level
+                    # exception, not a callback failure.
+                    raise
+                except Exception as e:
+                    # Any other exception would cause sys.monitoring to
+                    # DISABLE LINE events for this code object permanently.
+                    # Swallow it and log so the user's watch doesn't
+                    # silently die.
+                    _log_warn(
+                        f"_on_line: _fire_if_changed raised {e!r} for "
+                        f"{code.co_filename}:{line_number}; swallowed to "
+                        f"preserve monitoring.",
+                        always=True,
+                    )
         finally:
             self._guard.active = False
 
@@ -1417,6 +1455,19 @@ class WatchpointRegistry:
             # frame(2) = the actual user/library frame where LINE fired
             user_frame = sys._getframe(2)
             thread = threading.current_thread()
+
+            # Validate that pydevd hasn't already suspended this thread
+            # (e.g. from its own DEBUGGER_ID callback firing concurrently).
+            # Double-suspending crashes the pydevd protocol layer.
+            # pydevd stores thread state as `thread.additional_info.pydev_state`.
+            info = getattr(thread, 'additional_info', None)
+            if info is not None and getattr(info, 'pydev_state', 1) == 2:  # STATE_SUSPEND = 2
+                _log_warn(
+                    f"_trigger_direct_pause: thread already suspended, "
+                    f"skipping direct pause at "
+                    f"{user_frame.f_code.co_filename}:{line_number}"
+                )
+                return
 
             _log_warn(
                 f"_trigger_direct_pause: firing for "
@@ -2047,15 +2098,15 @@ class _AttributeWatch:
     suffices), or after `_remove_attr_watch_locked` restored the plain
     container in place of the wrapper.
     """
-    __slots__ = ("expr", "obj_ref", "original_cls", "watcher_cls", "initial_repr",
-                 "container_wrapper", "container_holder", "container_attr",
+    __slots__ = ("expr", "_obj_ref", "original_cls", "watcher_cls", "initial_repr",
+                 "container_wrapper", "_container_holder_ref", "container_attr",
                  "sub_watches", "classpatch_key",
                  "visited_ids", "sub_watches_capped")
 
     def __init__(self, expr: str, obj_ref: Any, original_cls: Optional[type],
                  watcher_cls: Optional[type], initial_repr: str) -> None:
         self.expr = expr
-        self.obj_ref = obj_ref
+        self._obj_ref = _make_weak_or_strong(obj_ref)
         self.original_cls = original_cls
         self.watcher_cls = watcher_cls
         self.initial_repr = initial_repr
@@ -2066,7 +2117,7 @@ class _AttributeWatch:
         # Holding the holder + attr separately means restoring on remove
         # doesn't need to re-parse `expr`.
         self.container_wrapper = None
-        self.container_holder = None
+        self._container_holder_ref = None
         self.container_attr = None
         # Sub-watches: child _AttributeWatch instances installed by recursive
         # object-tree instrumentation (see `_instrument_object_tree`). NOT
@@ -2104,6 +2155,31 @@ class _AttributeWatch:
         # bail out so a missed cycle can't grow the watch tree forever.
         # One warning logged per root the first time the cap engages.
         self.sub_watches_capped: bool = False
+
+    @property
+    def obj_ref(self):
+        """Dereference the weak (or strong-fallback) reference to the watched object.
+        Returns None if the referent has been garbage-collected.
+        """
+        return self._obj_ref()
+
+    @obj_ref.setter
+    def obj_ref(self, value):
+        self._obj_ref = _make_weak_or_strong(value)
+
+    @property
+    def container_holder(self):
+        """Dereference the weak (or strong-fallback) reference to the container's parent.
+        Returns None if the referent has been garbage-collected.
+        """
+        ref = self._container_holder_ref
+        if ref is None:
+            return None
+        return ref()
+
+    @container_holder.setter
+    def container_holder(self, value):
+        self._container_holder_ref = _make_weak_or_strong(value) if value is not None else None
 
 
 # ---------------------------------------------------------------------------
