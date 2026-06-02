@@ -57,8 +57,8 @@ class WatchpointDebugListener(private val project: Project) : XDebuggerManagerLi
             runCatching { proc.session.isStopped }.getOrDefault(true)
         }
 
-        val watchpointCode = WatchpointSessionManager.getInstance(project).consumeWatchpointCode()
-        if (watchpointCode == null) return
+        val watchpointPackage = WatchpointSessionManager.getInstance(project).consumeWatchpointPackage()
+        if (watchpointPackage == null) return
 
         logger.warn("=== WATCHPOINT SESSION STARTED ===")
 
@@ -88,7 +88,7 @@ class WatchpointDebugListener(private val project: Project) : XDebuggerManagerLi
                 retries++
                 delayMs = (delayMs * 1.5).toLong()
             }
-            verifyOrInject(debugProcess, watchpointCode)
+            verifyOrInject(debugProcess, watchpointPackage)
         }
     }
 
@@ -207,7 +207,7 @@ class WatchpointDebugListener(private val project: Project) : XDebuggerManagerLi
     // watchpoint.py boot verification / fallback inject
     // ------------------------------------------------------------------
 
-    private fun verifyOrInject(process: PyDebugProcess, watchpointCode: String) {
+    private fun verifyOrInject(process: PyDebugProcess, watchpointPackage: Map<String, String>) {
         val evaluator = process.evaluator ?: return
 
         // Probe builtins for the registry the script publishes on load.
@@ -224,38 +224,55 @@ import builtins
                 // checking toString() would always match. Use .value instead.
                 val resultStr = (result as? PyDebugValue)?.value ?: result.toString()
                 if (resultStr.contains("NEED_INJECTION")) {
-                    injectAsFallback(process, watchpointCode)
+                    injectAsFallback(process, watchpointPackage)
                 } else {
-                    logger.warn("watchpoint.py already booted via sitecustomize – no fallback needed")
+                    logger.warn("_pycharm_watchpoint already booted via sitecustomize – no fallback needed")
                 }
             }
 
             override fun errorOccurred(errorMessage: String) {
                 logger.warn("Probe error – attempting fallback inject: $errorMessage")
-                injectAsFallback(process, watchpointCode)
+                injectAsFallback(process, watchpointPackage)
             }
         }, null)
     }
 
-    private fun injectAsFallback(process: PyDebugProcess, watchpointCode: String) {
+    private fun injectAsFallback(process: PyDebugProcess, watchpointPackage: Map<String, String>) {
         val evaluator = process.evaluator ?: return
         if (!injected.add(process)) return
 
-        logger.warn("Injecting watchpoint.py as fallback")
-        val encoded = Base64.getEncoder().encodeToString(watchpointCode.toByteArray())
+        logger.warn("Injecting _pycharm_watchpoint package as fallback")
 
-        // Run in a synthetic module named '_pycharm_watchpoint' so the WatchpointHit
-        // class resolves to module '_pycharm_watchpoint' – which matches the exception
-        // breakpoint we registered for "_pycharm_watchpoint.WatchpointHit".
+        // Build a Python dict literal of {filename: base64(source)} for every
+        // submodule, then have the debuggee write them to a fresh temp dir and
+        // `import _pycharm_watchpoint`. We materialize real files (rather than
+        // exec a blob into one module dict) so the package's relative imports and
+        // WatchpointHit.__module__ == '_pycharm_watchpoint' both resolve – exactly
+        // as the sitecustomize path does. Local debugging shares the filesystem,
+        // so files written from the evaluated code are importable in-process.
+        val filesDict = watchpointPackage.entries.joinToString(",\n        ") { (name, src) ->
+            val b64 = Base64.getEncoder().encodeToString(src.toByteArray())
+            "'$name': '$b64'"
+        }
+
         val command = """
-import base64, builtins, types, sys
+import base64, builtins, sys, os, tempfile
 try:
     if hasattr(builtins, '_watchpoint_registry'):
-        print("[WATCHPOINT] Fallback skipped: watchpoint.py already loaded")
+        print("[WATCHPOINT] Fallback skipped: _pycharm_watchpoint already loaded")
     else:
-        _wp_mod = types.ModuleType('_pycharm_watchpoint')
-        sys.modules['_pycharm_watchpoint'] = _wp_mod
-        exec(base64.b64decode('$encoded').decode('utf-8'), _wp_mod.__dict__)
+        _files = {
+        $filesDict
+        }
+        _d = tempfile.mkdtemp(prefix='pycharm_wp_fb_')
+        _pkg = os.path.join(_d, '_pycharm_watchpoint')
+        os.makedirs(_pkg, exist_ok=True)
+        for _n, _b in _files.items():
+            with open(os.path.join(_pkg, _n), 'wb') as _f:
+                _f.write(base64.b64decode(_b))
+        if _d not in sys.path:
+            sys.path.insert(0, _d)
+        import _pycharm_watchpoint
         print("[WATCHPOINT] Fallback injection successful")
 except Exception as e:
     print(f"[WATCHPOINT] Fallback failed: {e}")

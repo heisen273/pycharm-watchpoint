@@ -52,11 +52,32 @@ src/main/resources/
 ├── META-INF/plugin.xml
 ├── icons/                             # Plugin-owned SVGs (light/dark × 16px/20px)
 └── python/                            # Bundled watchpoint runtime
-    ├── watchpoint.py
-    ├── test_watchpoint.py
+    ├── _pycharm_watchpoint/           # Runtime package (minified into the jar at build)
+    │   ├── __init__.py                # singleton + public API + builtins publishing + WatchpointHit rebrand
+    │   ├── constants.py               # version guard + cross-module mutable globals
+    │   ├── hit.py                     # WatchpointHit (leaf)
+    │   ├── helpers.py  caller.py      # repr/log/hashing; frame-walk + filename classification
+    │   ├── pydevd_pause.py            # debugger lookup, bp install, pause mechanisms
+    │   ├── watch_data.py  containers.py  classpatch.py
+    │   └── registry.py                # WatchpointRegistry + _setup_monitoring
+    ├── tests/                         # themed pytest modules + util.py (shared helpers)
     ├── conftest.py
+    ├── pydevd_boost.py
     └── CLAUDE.md                      # Runtime-side handoff
 ```
+
+The runtime is a real package (was one monolithic `watchpoint.py`). Submodules
+import each other downward (no cycles); the three cross-module **mutable** globals
+(`_WATCHPOINT_LOG`, `_TOOL_ID`, `_installing_watch_thread`) live in `constants.py`
+and are accessed as `constants.X` (never `from .constants import X`, which would
+snapshot the value). `WatchpointHit` lives in `hit.py` but `__init__.py` rebrands
+`WatchpointHit.__module__ = __name__` so the IDE exception breakpoint match
+(`_pycharm_watchpoint.WatchpointHit`) still works. `__init__.py` re-exports the
+whole internal surface so `from _pycharm_watchpoint import <anything>` works.
+
+The ordered list of submodules that ship is `DebugWithWatchpointAction.MODULE_FILES`
+(single source of truth for both injection paths) – add a line there when adding a
+submodule, and `build.gradle.kts` minifies every `*.py` in the package dir.
 
 ## plugin.xml essentials
 
@@ -89,19 +110,19 @@ Action groups:
 
 1. `DebugWithWatchpointAction.actionPerformed`:
    - `cleanAllConfigurations(project)` – pre-filters dirty configs, then wraps mutations in `WriteAction` to avoid read-access assertions on 2024+. Strips leftover `PYCHARM_WATCHPOINT_ACTIVE` env + temp-dir `PYTHONPATH` from saved configs. Skips entirely if no configs need cleaning (avoids spurious "Settings Modified" prompts).
-   - Loads `watchpoint.py`, base64-encodes it.
-   - `WatchpointSessionManager.startSession(code)` stashes the source.
+   - `loadWatchpointPackage()` reads each `MODULE_FILES` entry from `/python/_pycharm_watchpoint/` into a `filename -> source` map.
+   - `WatchpointSessionManager.startSession(pkg)` stashes the map.
    - **Clones** the currently-selected run config (does NOT mutate the user's saved config), renames to `"[WATCHPOINT] <original>"`.
-   - `injectViaSiteCustomize(clonedConfig, code)`:
-     - Writes `sitecustomize.py` to a fresh temp dir (`/tmp/pycharm_watchpoint_XXX/`).
+   - `injectViaSiteCustomize(clonedConfig, pkg)`:
+     - Writes each submodule to `<tempdir>/_pycharm_watchpoint/<name>.py` and a `sitecustomize.py` that does `import _pycharm_watchpoint` (the temp dir is on `PYTHONPATH`, so normal import + relative imports work; no base64/exec for the runtime – boost is still base64-exec'd).
      - Sets `PYTHONPATH = <tempdir>:<existing>`, `PYCHARM_WATCHPOINT_ACTIVE=1`, `PYCHARM_WATCHPOINT_USER_ROOTS=<project.basePath>`.
    - `ProgramRunnerUtil.executeConfiguration(...)`.
 
 2. `WatchpointDebugListener.processStarted`:
    - Purges stale entries from `breakpoints` / `highlighters` maps for dead processes that never got `processStopped` (crash resilience).
-   - Consumes queued source from session manager.
+   - Consumes the queued package map from session manager.
    - Registers Python exception breakpoint for `_pycharm_watchpoint.WatchpointHit` (safety net).
-   - Exponential-backoff retry (300ms initial, ×1.5, up to 5 attempts) waiting for evaluator readiness, then probes `hasattr(builtins, ...)`. If sitecustomize didn't load, base64+exec the runtime via evaluator as fallback.
+   - Exponential-backoff retry (300ms initial, ×1.5, up to 5 attempts) waiting for evaluator readiness, then probes `hasattr(builtins, ...)`. If sitecustomize didn't load, the fallback evaluates a command that writes the base64-embedded package files to a fresh `tempfile.mkdtemp()`, inserts it on `sys.path`, and `import _pycharm_watchpoint` (mirrors the sitecustomize path – real files, not an exec-into-one-dict blob).
 
 3. `WatchpointDebugListener.processStopped`:
    - Removes the exception breakpoint.
@@ -288,16 +309,26 @@ ProgramRunnerUtil.executeConfiguration(newSettings, DefaultDebugExecutor.getDebu
 
 ## sitecustomize injection pattern
 
+The runtime is now a package written to disk, not a base64 blob exec'd into one
+module dict. `injectViaSiteCustomize` writes `<tempdir>/_pycharm_watchpoint/*.py`
+and a sitecustomize that imports it:
+
 ```python
 if os.environ.get('PYCHARM_WATCHPOINT_ACTIVE') == '1':
-    _wp_mod = types.ModuleType('_pycharm_watchpoint')   # register before exec
-    sys.modules['_pycharm_watchpoint'] = _wp_mod         # so WatchpointHit.__module__ == '_pycharm_watchpoint'
-    exec(base64.b64decode('<...>').decode(), _wp_mod.__dict__)
+    import _pycharm_watchpoint   # tempdir is on PYTHONPATH; real import machinery
 ```
 
-The `__module__` matters because the IDE exception breakpoint is registered as `"_pycharm_watchpoint.WatchpointHit"`. Exec'ing into `globals()` of sitecustomize makes the class's `__module__` become `"sitecustomize"` and the breakpoint never matches.
+The `__module__` of `WatchpointHit` must be `"_pycharm_watchpoint"` because the IDE
+exception breakpoint is registered as `"_pycharm_watchpoint.WatchpointHit"`. The
+class is defined in the leaf `hit.py` (so its natural `__module__` would be
+`_pycharm_watchpoint.hit`); `__init__.py` rebrands it with
+`WatchpointHit.__module__ = __name__`. Importing the real package as
+`_pycharm_watchpoint` makes `__name__` resolve correctly in both prod and tests.
 
-Module is named `_pycharm_watchpoint` (not `watchpoint`) to avoid colliding with user packages. If you rename it, update: sitecustomize bootstrap, fallback injection, exception breakpoint name, and the framework denylist in `watchpoint.py`.
+The package dir is named `_pycharm_watchpoint` (not `watchpoint`) to avoid colliding
+with user packages. If you rename it, update: the source dir, sitecustomize bootstrap,
+fallback injection (writes the same dir name), exception breakpoint name, the
+`__init__.py` rebrand, and the framework denylist in `helpers.py`.
 
 ## Hit-line decorations (`WatchpointHitHighlighter`)
 
@@ -365,9 +396,18 @@ Field names with `my` prefix (JetBrains Java convention) – setters drop the pr
 
 ## When changing the runtime
 
-After editing `watchpoint.py`, rebuild the plugin (`processResources` + relaunch sandbox). The runtime is base64-encoded into the resource jar at build time.
+After editing any `_pycharm_watchpoint/` submodule, rebuild the plugin
+(`processResources` + relaunch sandbox). Each submodule is minified (pyminify,
+`build.gradle.kts`) and written as a real file into the resource jar at build
+time; the plugin materializes the package to a temp dir and imports it.
 
-If `./gradlew runIde` doesn't pick up changes, run `./gradlew clean` first. Check `_RUNTIME_VERSION` in `/tmp/pythonwatchpoint.log` to confirm the expected version is loaded.
+Run the tests from `src/main/resources/python/` with `pytest` (themed modules live
+in `tests/`, sharing helpers in `tests/util.py`; `conftest.py` boots the package +
+resets state between tests). Bump `_RUNTIME_VERSION` in `caller.py` on behavioral
+changes. If `./gradlew runIde` doesn't pick up changes, run `./gradlew clean` first.
+Check `_RUNTIME_VERSION` in `/tmp/pythonwatchpoint.log` to confirm the loaded version.
+
+If you add a submodule, also add it to `DebugWithWatchpointAction.MODULE_FILES`.
 
 ## When bumping PyCharm version
 

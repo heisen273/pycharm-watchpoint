@@ -5,23 +5,25 @@ import com.intellij.openapi.project.Project
 import java.util.concurrent.atomic.AtomicReference
 
 /**
- * Per-project carrier for the watchpoint.py source that the "Debug with Watchpoint"
- * action wants the next debug session to inject. The session listener consumes the
- * stored code on processStarted, leaving the manager empty for plain Debug runs.
+ * Per-project carrier for the `_pycharm_watchpoint` runtime package that the
+ * "Debug with Watchpoint" action wants the next debug session to inject. The
+ * package is carried as a `filename -> source` map (one entry per submodule).
+ * The session listener consumes the stored map on processStarted, leaving the
+ * manager empty for plain Debug runs.
  */
 @Service(Service.Level.PROJECT)
 class WatchpointSessionManager(private val project: Project) {
 
-    private val watchpointCode = AtomicReference<String?>(null)
+    private val watchpointPackage = AtomicReference<Map<String, String>?>(null)
 
-    /** Stash the watchpoint.py source that the next debug session should inject. */
-    fun startSession(code: String) {
-        watchpointCode.set(code)
+    /** Stash the runtime package (filename -> source) the next session should inject. */
+    fun startSession(pkg: Map<String, String>) {
+        watchpointPackage.set(pkg)
     }
 
-    /** Atomically retrieve and clear the queued code (single-use per session). */
-    fun consumeWatchpointCode(): String? {
-        return watchpointCode.getAndSet(null)
+    /** Atomically retrieve and clear the queued package (single-use per session). */
+    fun consumeWatchpointPackage(): Map<String, String>? {
+        return watchpointPackage.getAndSet(null)
     }
 
     companion object {

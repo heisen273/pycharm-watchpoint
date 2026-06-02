@@ -5,16 +5,25 @@
 
 ## TL;DR
 
-- `watchpoint.py` – runtime: registry, sys.monitoring callbacks, pydevd integration.
-- `test_watchpoint.py` – 198 tests, pure-pytest (no pydevd).
-- `conftest.py` – per-test cleanup of registry + frame state.
+- `_pycharm_watchpoint/` – runtime **package**: `registry.py` (state + sys.monitoring
+  callbacks + `_setup_monitoring`), `pydevd_pause.py` (pydevd integration), plus
+  `constants/hit/helpers/caller/watch_data/containers/classpatch`, wired by
+  `__init__.py` (singleton, public API, builtins publishing, `WatchpointHit`
+  rebrand). Submodules import downward only (no cycles); the cross-module mutable
+  globals (`_WATCHPOINT_LOG`, `_TOOL_ID`, `_installing_watch_thread`) live in
+  `constants.py` and are accessed as `constants.X`.
+- `tests/` – themed pytest modules (was one `test_watchpoint.py`); shared helpers
+  in `tests/util.py`.
+- `conftest.py` – puts this dir on `sys.path`, boots the package, per-test cleanup
+  of registry + frame state.
 - Targets **Python 3.12, 3.13, 3.14**.
 - **Zero global sys.monitoring overhead** until the first `watch()` call.
 
 ```bash
-python3.12 -m pytest test_watchpoint.py
-python3.13 -m pytest test_watchpoint.py
-python3.14 -m pytest test_watchpoint.py
+# from src/main/resources/python/
+python3.12 -m pytest
+python3.13 -m pytest
+python3.14 -m pytest
 ```
 
 ## Public API
@@ -215,7 +224,19 @@ info.pydev_step_stop = user_frame
 
 `_find_paused_user_frame` walks every thread's stack via `sys._current_frames()` matching by `co_name == func_hint` + multiple file-suffix comparisons (absolute / `/private/var/...` / basename). When multiple candidates match (recursion) → picks the **innermost** frame.
 
-## Key code map (`watchpoint.py`)
+## Key code map (`_pycharm_watchpoint/` package)
+
+Module homes: `registry.py` holds `WatchpointRegistry`, all sys.monitoring
+callbacks, and `_setup_monitoring`. `pydevd_pause.py` holds the pause/breakpoint
+machinery (`_install_bp_at`, `_pause_via_*`, `_remove_temp_breakpoints`,
+`_get_pydevd_debugger`, the `_next_*`/`_offset_to_line` line helpers). `caller.py`
+holds the frame-walkers + `_is_library_filename`/`_is_pydevd_internal`/
+`_is_runtime_filename` + `_RUNTIME_VERSION`. `helpers.py` holds `_value_hash`,
+`_log_warn`, `_FRAMEWORK_MODULE_ROOTS`, the `_MAX_*` caps. `containers.py`/
+`classpatch.py`/`watch_data.py`/`hit.py`/`constants.py` are as named. `__init__.py`
+holds the public API + singleton + builtins wiring. The five pydevd helpers the
+tests monkeypatch are referenced module-qualified (`pydevd_pause.X`) from `registry`
+/`__init__`, so patch them at `_pycharm_watchpoint.pydevd_pause.X`.
 
 | Symbol | Purpose |
 | --- | --- |
@@ -315,7 +336,15 @@ info.pydev_step_stop = user_frame
 - **Asyncio task cancellation leaks watch state.** `PY_RETURN` doesn't reliably fire for cancelled coroutine frames. Stale entries are cleaned by `clear_watches()` on the next session start. Pinned by xfail test.
 - **C-extension in-place mutation invisible.** `_value_hash` for custom objects uses `id()` only – numpy array `a[0] = 99` doesn't change identity. Watch the dotted path or rebind instead.
 
-## Test layout (16 bands, 198 tests)
+## Test layout (208 tests across themed modules under `tests/`)
+
+Tests live in `tests/test_*.py` (split from the old monolithic `test_watchpoint.py`),
+with shared helpers in `tests/util.py`. The five pydevd helpers are monkeypatched at
+`_pycharm_watchpoint.pydevd_pause.X`. The conceptual bands below still describe the
+coverage; they now map across files like `test_basics.py`, `test_regression.py`,
+`test_pause_anchor.py`, `test_loopback_bp.py`, `test_bp_pause_pending.py`,
+`test_install_suppression.py`, `test_overlap_edge.py`, `test_hit_payload.py`,
+`test_edge_coverage.py`, `test_locate_watches.py`.
 
 1. **Basics** – fire on change, old/new, source line, unwatch, clear, multiple watches.
 2. **Frame lifetime** – repeated calls, recursion, stale-state reset.

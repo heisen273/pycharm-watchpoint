@@ -63,46 +63,57 @@ tasks.withType<JavaCompile>().configureEach {
 }
 
 // ── Python watchpoint minification ─────────────────────────────────────────
-// Runs pyminify on watchpoint.py before packaging so the plain source never
-// ends up in the distribution JAR. Docstrings, comments, and local variable
-// names are all stripped; public names (_pycharm_watch_at, WatchpointHit,
-// etc.) are intentionally preserved because the Kotlin side calls them by
-// string via the pydevd evaluator.
+// Runs pyminify on every module of the `_pycharm_watchpoint` runtime package
+// before packaging so the plain source never ends up in the distribution JAR.
+// Docstrings, comments, and local variable names are all stripped; module-level
+// and public names (_pycharm_watch_at, WatchpointHit, the cross-module imports,
+// etc.) are intentionally preserved because the Kotlin side calls them by string
+// via the pydevd evaluator and the submodules import each other by name.
 //
 // Configure `pyminifyPath` in gradle.properties (or pass -PpyminifyPath=...)
 // to point at the pyminify binary. Defaults to "pyminify" on the system PATH.
 
 val pyminifyPath: String = findProperty("pyminifyPath")?.toString() ?: "pyminify"
 
-val minifyWatchpointFile = layout.buildDirectory.file("obfuscated/python/watchpoint.py")
+val watchpointPkgSrcDir = layout.projectDirectory.dir("src/main/resources/python/_pycharm_watchpoint")
+val watchpointPkgMinDir = layout.buildDirectory.dir("obfuscated/python/_pycharm_watchpoint")
 
-val minifyWatchpointPy by tasks.registering(Exec::class) {
-    description = "Minifies watchpoint.py via pyminify before it is packaged into the JAR."
-    group = "build"
-
-    val sourceFile = layout.projectDirectory.file("src/main/resources/python/watchpoint.py")
-    inputs.file(sourceFile)
-    outputs.file(minifyWatchpointFile)
-
-    doFirst {
-        minifyWatchpointFile.get().asFile.parentFile.mkdirs()
+// One Exec task per submodule (pyminify is single-file). Discovered at
+// configuration time from the package directory checked into the repo.
+val watchpointModuleMinifiers = watchpointPkgSrcDir.asFile
+    .listFiles { f -> f.isFile && f.extension == "py" }
+    .orEmpty()
+    .sortedBy { it.name }
+    .map { src ->
+        tasks.register<Exec>("minifyWatchpoint_${src.nameWithoutExtension}") {
+            description = "Minifies _pycharm_watchpoint/${src.name} via pyminify."
+            group = "build"
+            val out = watchpointPkgMinDir.map { it.file(src.name) }
+            inputs.file(src)
+            outputs.file(out)
+            doFirst { out.get().asFile.parentFile.mkdirs() }
+            commandLine(
+                pyminifyPath,
+                "--remove-literal-statements",   // strips all docstrings
+                "--output", out.get().asFile.absolutePath,
+                src.absolutePath,
+            )
+        }
     }
 
-    commandLine(
-        pyminifyPath,
-        "--remove-literal-statements",   // strips all docstrings
-        "--output", minifyWatchpointFile.get().asFile.absolutePath,
-        sourceFile.asFile.absolutePath,
-    )
+val minifyWatchpointPy by tasks.registering {
+    description = "Minifies the entire _pycharm_watchpoint runtime package before packaging."
+    group = "build"
+    dependsOn(watchpointModuleMinifiers)
 }
 
-// Swap out the plain watchpoint.py for the minified copy in processResources.
+// Swap out the plain package sources for the minified copies in processResources.
 tasks.named<ProcessResources>("processResources") {
     dependsOn(minifyWatchpointPy)
-    exclude("python/watchpoint.py")
-    from(minifyWatchpointFile.map { it.asFile.parentFile }) {
-        into("python")
-        include("watchpoint.py")
+    exclude("python/_pycharm_watchpoint/**")
+    from(watchpointPkgMinDir) {
+        into("python/_pycharm_watchpoint")
+        include("*.py")
     }
 }
 

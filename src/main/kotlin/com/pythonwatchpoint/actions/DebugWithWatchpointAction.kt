@@ -19,9 +19,10 @@ import java.util.Base64
 
 /**
  * Toolbar entry point. Clones the currently-selected Python run configuration,
- * augments it with a sitecustomize.py that bootstraps watchpoint.py at interpreter
- * start-up, then launches a debug session on the clone. The original config is
- * left untouched so plain "Debug" still produces a clean session.
+ * augments it with a sitecustomize.py that materializes + imports the
+ * `_pycharm_watchpoint` runtime package at interpreter start-up, then launches a
+ * debug session on the clone. The original config is left untouched so plain
+ * "Debug" still produces a clean session.
  *
  * Clones the selected run config so the original stays clean.
  */
@@ -34,9 +35,9 @@ class DebugWithWatchpointAction : AnAction(), DumbAware {
         // Defensive: scrub any leftover watchpoint environment from prior aborted runs.
         cleanAllConfigurations(project)
 
-        val watchpointCode = loadWatchpointScript()
-        if (watchpointCode == null) {
-            logger.error("Failed to load watchpoint.py")
+        val watchpointPackage = loadWatchpointPackage()
+        if (watchpointPackage == null) {
+            logger.error("Failed to load _pycharm_watchpoint package")
             return
         }
         val runManager = RunManager.getInstance(project)
@@ -52,12 +53,12 @@ class DebugWithWatchpointAction : AnAction(), DumbAware {
         val clonedConfig = originalConfig.clone() as AbstractPythonRunConfiguration<*>
         clonedConfig.name = "[WATCHPOINT] ${originalConfig.name}"
 
-        injectViaSiteCustomize(project, clonedConfig, watchpointCode)
+        injectViaSiteCustomize(project, clonedConfig, watchpointPackage)
 
         val newSettings = runManager.createConfiguration(clonedConfig, selectedSettings.factory)
         newSettings.isTemporary = true
 
-        WatchpointSessionManager.getInstance(project).startSession(watchpointCode)
+        WatchpointSessionManager.getInstance(project).startSession(watchpointPackage)
 
         val executor = DefaultDebugExecutor.getDebugExecutorInstance()
         ProgramRunnerUtil.executeConfiguration(newSettings, executor)
@@ -129,13 +130,32 @@ class DebugWithWatchpointAction : AnAction(), DumbAware {
         }
     }
 
-    private fun loadWatchpointScript(): String? {
+    /**
+     * Load the `_pycharm_watchpoint` runtime package from plugin resources as a
+     * `filename -> source` map. Returns null if any module is missing.
+     *
+     * `MODULE_FILES` is the single source of truth for which files make up the
+     * package – keep it in sync with `src/main/resources/python/_pycharm_watchpoint/`
+     * (add a line when adding a submodule). We list files explicitly rather than
+     * enumerate the resource directory because directory listing is unreliable
+     * against the Gradle IntelliJ jar layout.
+     */
+    private fun loadWatchpointPackage(): Map<String, String>? {
         return try {
-            javaClass.getResourceAsStream("/python/watchpoint.py")
-                ?.bufferedReader()
-                ?.readText()
+            val pkg = LinkedHashMap<String, String>()
+            for (name in MODULE_FILES) {
+                val text = javaClass.getResourceAsStream("/python/_pycharm_watchpoint/$name")
+                    ?.bufferedReader()
+                    ?.readText()
+                if (text == null) {
+                    logger.error("Missing watchpoint runtime module: $name")
+                    return null
+                }
+                pkg[name] = text
+            }
+            pkg
         } catch (e: Exception) {
-            logger.error("Failed to read watchpoint.py", e)
+            logger.error("Failed to read _pycharm_watchpoint package", e)
             null
         }
     }
@@ -152,10 +172,17 @@ class DebugWithWatchpointAction : AnAction(), DumbAware {
     }
 
     /**
-     * Writes a sitecustomize.py that decodes and execs watchpoint.py at interpreter
-     * startup, then prepends its directory to PYTHONPATH and sets the activation env var.
-     * Gated by PYCHARM_WATCHPOINT_ACTIVE so other interpreters that happen to inherit
-     * the path don't accidentally boot watchpoint logic.
+     * Writes the `_pycharm_watchpoint` package to a temp dir and a sitecustomize.py
+     * that imports it at interpreter startup, then prepends the temp dir to
+     * PYTHONPATH and sets the activation env var. Gated by PYCHARM_WATCHPOINT_ACTIVE
+     * so other interpreters that happen to inherit the path don't accidentally boot
+     * watchpoint logic.
+     *
+     * The package is written as real .py files (so normal import machinery +
+     * relative imports just work, and WatchpointHit.__module__ resolves to
+     * '_pycharm_watchpoint' – what the IDE exception breakpoint matches). The temp
+     * dir is the parent of the package dir and is on PYTHONPATH, so a plain
+     * `import _pycharm_watchpoint` resolves.
      *
      * Also forces PYDEVD_USE_CYTHON=NO and installs pydevd_boost patches for
      * dramatically faster debug session startup (15-156x improvement on PEP 669 path).
@@ -163,12 +190,18 @@ class DebugWithWatchpointAction : AnAction(), DumbAware {
     private fun injectViaSiteCustomize(
         project: Project,
         config: AbstractPythonRunConfiguration<*>,
-        watchpointCode: String,
+        watchpointPackage: Map<String, String>,
     ) {
         try {
             val tempDir = Files.createTempDirectory("pycharm_watchpoint_").toFile()
             val siteCustomize = File(tempDir, "sitecustomize.py")
-            val encodedCode = Base64.getEncoder().encodeToString(watchpointCode.toByteArray())
+
+            // Materialize the runtime package as real files: <tempDir>/_pycharm_watchpoint/*.py
+            val pkgDir = File(tempDir, "_pycharm_watchpoint")
+            pkgDir.mkdirs()
+            for ((name, source) in watchpointPackage) {
+                File(pkgDir, name).writeText(source)
+            }
 
             // Load and encode pydevd_boost.py for injection alongside watchpoint
             val boostCode = loadBoostScript()
@@ -204,14 +237,13 @@ if os.environ.get('PYCHARM_WATCHPOINT_ACTIVE') == '1':
         print(f"[WATCHPOINT-BOOST] Skipped – Python {sys.version_info.major}.{sys.version_info.minor} < 3.12 (PEP 669 not available)", file=sys.stderr)
 
     try:
-        # Bootstrap as a real module so WatchpointHit.__module__ == '_pycharm_watchpoint',
-        # which is what the IDE-side exception breakpoint matches against.
-        # Using underscore-prefixed name to avoid colliding with user projects
-        # that have their own top-level 'watchpoint' package.
-        _wp_mod = types.ModuleType('_pycharm_watchpoint')
-        sys.modules['_pycharm_watchpoint'] = _wp_mod
-        _wp_code = base64.b64decode('$encodedCode').decode('utf-8')
-        exec(_wp_code, _wp_mod.__dict__)
+        # Import the runtime package written next to this sitecustomize. Our temp
+        # dir is prepended to PYTHONPATH (and is the dir this file loads from), so
+        # it is on sys.path when site.py runs us. Importing the real package makes
+        # WatchpointHit.__module__ == '_pycharm_watchpoint' (rebranded in __init__),
+        # which is what the IDE-side exception breakpoint matches against. The
+        # underscore-prefixed name avoids colliding with a user's own 'watchpoint'.
+        import _pycharm_watchpoint
         print(f"[WATCHPOINT] Loaded in process {os.getpid()}", file=sys.stderr)
     except Exception as e:
         print(f"[WATCHPOINT] Boot failed: {e}", file=sys.stderr)
@@ -275,5 +307,27 @@ finally:
             e.presentation.text = "Debug with Watchpoint"
             e.presentation.icon = WatchpointIcons.DebugWatch
         }
+    }
+
+    companion object {
+        /**
+         * The submodules that make up the `_pycharm_watchpoint` runtime package,
+         * under `src/main/resources/python/_pycharm_watchpoint/`. Single source of
+         * truth for both injection paths (sitecustomize + evaluator fallback) –
+         * add a line here when you add a submodule. Order is irrelevant (the files
+         * are written to disk and imported via normal Python machinery).
+         */
+        val MODULE_FILES: List<String> = listOf(
+            "__init__.py",
+            "constants.py",
+            "hit.py",
+            "helpers.py",
+            "caller.py",
+            "pydevd_pause.py",
+            "watch_data.py",
+            "containers.py",
+            "classpatch.py",
+            "registry.py",
+        )
     }
 }
