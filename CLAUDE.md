@@ -86,7 +86,7 @@ Action groups:
 ### "Debug with Watchpoint" path
 
 1. `DebugWithWatchpointAction.actionPerformed`:
-   - `cleanAllConfigurations(project)` – strips leftover `PYCHARM_WATCHPOINT_ACTIVE` env + temp-dir `PYTHONPATH` from all saved configs.
+   - `cleanAllConfigurations(project)` – pre-filters dirty configs, then wraps mutations in `WriteAction` to avoid read-access assertions on 2024+. Strips leftover `PYCHARM_WATCHPOINT_ACTIVE` env + temp-dir `PYTHONPATH` from saved configs. Skips entirely if no configs need cleaning (avoids spurious "Settings Modified" prompts).
    - Loads `watchpoint.py`, base64-encodes it.
    - `WatchpointSessionManager.startSession(code)` stashes the source.
    - **Clones** the currently-selected run config (does NOT mutate the user's saved config), renames to `"[WATCHPOINT] <original>"`.
@@ -96,9 +96,10 @@ Action groups:
    - `ProgramRunnerUtil.executeConfiguration(...)`.
 
 2. `WatchpointDebugListener.processStarted`:
+   - Purges stale entries from `breakpoints` / `highlighters` maps for dead processes that never got `processStopped` (crash resilience).
    - Consumes queued source from session manager.
    - Registers Python exception breakpoint for `_pycharm_watchpoint.WatchpointHit` (safety net).
-   - 500ms delay → probes `hasattr(builtins, ...)`. If sitecustomize didn't load, base64+exec the runtime via evaluator as fallback.
+   - Exponential-backoff retry (300ms initial, ×1.5, up to 5 attempts) waiting for evaluator readiness, then probes `hasattr(builtins, ...)`. If sitecustomize didn't load, base64+exec the runtime via evaluator as fallback.
 
 3. `WatchpointDebugListener.processStopped`:
    - Removes the exception breakpoint.
@@ -208,10 +209,10 @@ No-arg `Alarm()` is deprecated in 2025.1. Use `Alarm(project)` so the alarm is c
 
 Watches are stored as `WatchKey(expression: String, frameId: Long)` where `frameId` is the Python `id(frame)` returned by `watch_at()`. This prevents a watch on `"self"` from lighting up every row named `"self"` across all threads and stack frames.
 
-`add(expression, frameId)` – arm.  
-`remove(expression)` – disarm (by expression only; frameId not needed on remove).  
-`isWatched(expression, frameId)` – exact match.  
-`isWatched(expression)` – name-only fallback for rebind-only watches where the frame id has changed.
+`add(expression, frameId)` – arm; also increments `expressionCounts[expression]`.  
+`remove(expression)` – disarm (by expression only; frameId not needed on remove); clears the count entry.  
+`isWatched(expression, frameId)` – exact match (set lookup).  
+`isWatched(expression)` – O(1) via `expressionCounts` map; name-only fallback for rebind-only watches where the frame id has changed.
 
 The `WatchpointTreeCellRenderer` and `AddWatchpointAction.update()` use a three-pronged check:
 1. Frame-scoped marker (`isWatched(path, frameId)`) – exact frame.
@@ -284,7 +285,7 @@ Module is named `_pycharm_watchpoint` (not `watchpoint`) to avoid colliding with
 
 ## Hit-line decorations (`WatchpointHitHighlighter`)
 
-On every `sessionPaused`, queries `_pycharm_consume_last_hit()` – returns base64-encoded UTF-8 of NUL-separated `file\0line\0name\0old\0new\0caller_file\0caller_line` (7 fields) or `""` if not a watchpoint hit.
+On every `sessionPaused`, queries `_pycharm_consume_last_hit()` – returns base64-encoded UTF-8 of NUL-separated `file\0line\0name\0old\0new\0caller_file\0caller_line` (7 fields) or `""` if not a watchpoint hit. The pooled-thread eval is guarded by `session.isStopped` check before the blocking call – prevents indefinite hangs when the session dies between dispatch and execution.
 
 **Two-phase highlight** (critical – do not collapse into one):
 - **Phase 1 (immediate via `invokeLater`)**: open the mutation file + install decorations:
@@ -304,7 +305,7 @@ On every `sessionPaused`, queries `_pycharm_consume_last_hit()` – returns base
 
 ## Variables-panel highlighting
 
-`WatchpointMarkerService` – project-scoped service holding armed watch expressions keyed by `(expression, frameId)`. Cleared on `processStarted` to prevent ghost-highlighting from previous sessions.
+`WatchpointMarkerService` – project-scoped service holding armed watch expressions keyed by `(expression, frameId)`. Cleared on `processStarted` to prevent ghost-highlighting from previous sessions. Uses a secondary `expressionCounts` index (`ConcurrentHashMap<String, Int>`) for O(1) name-only lookups – avoids linear scan on every Variables-panel cell paint.
 
 `WatchpointTreeCellRenderer` – wraps the default renderer. Installed lazily on first watch arm (idempotent via instanceof check). For each cell, computes the row's full dotted path and checks via the three-pronged `isWatched` logic (frame-scoped → name-only → type-sniff); if matched:
 - Swaps icon to `WatchpointIcons.Watch` (always, even on selected rows).

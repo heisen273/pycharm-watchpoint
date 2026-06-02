@@ -35,6 +35,10 @@ class WatchpointMarkerService {
      */
     data class WatchKey(val expression: String, val frameId: Long)
 
+    // Secondary index: expression -> count of entries with that expression.
+    // Enables O(1) name-only lookup instead of linear scan on every cell paint.
+    private val expressionCounts = ConcurrentHashMap<String, Int>()
+
     private val watched: MutableSet<WatchKey> =
         Collections.newSetFromMap(ConcurrentHashMap<WatchKey, Boolean>())
 
@@ -43,16 +47,20 @@ class WatchpointMarkerService {
      * (the Python `id(frame)` returned by `watch_at`).
      */
     fun add(expression: String, frameId: Long) {
-        watched.add(WatchKey(expression, frameId))
-    }
-
+            if (watched.add(WatchKey(expression, frameId))) {
+                expressionCounts.merge(expression, 1, Int::plus)
+            }
+        }
     /**
      * Disarm the watch for `expression` regardless of which frame it was
      * registered against. Called from the Remove path where we only have the
      * expression string — the frame has already been cleaned up by the runtime.
      */
     fun remove(expression: String) {
-        watched.removeIf { it.expression == expression }
+        val removed = watched.removeIf { it.expression == expression }
+        if (removed) {
+            expressionCounts.remove(expression)
+        }
     }
 
     /**
@@ -73,6 +81,7 @@ class WatchpointMarkerService {
     /** Drop all entries. Called on session start so stale watches don't leak across runs. */
     fun clear() {
         watched.clear()
+        expressionCounts.clear()
     }
 
     companion object {

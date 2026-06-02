@@ -72,40 +72,55 @@ class DebugWithWatchpointAction : AnAction(), DumbAware {
         val runManager = RunManager.getInstance(project)
         var cleanedCount = 0
 
-        for (settings in runManager.allSettings) {
+        // Check if any config needs cleaning before acquiring write action.
+        val dirtyConfigs = runManager.allSettings.filter { settings ->
             val config = settings.configuration
-            if (config !is AbstractPythonRunConfiguration<*>) continue
+            if (config !is AbstractPythonRunConfiguration<*>) return@filter false
+            val envs = config.envs
+            envs.containsKey("PYCHARM_WATCHPOINT_ACTIVE") ||
+            envs.containsKey("PYCHARM_WATCHPOINT_USER_ROOTS") ||
+            envs.containsKey("PYDEVD_USE_CYTHON") ||
+            (envs["PYTHONPATH"]?.contains("pycharm_watchpoint_") == true)
+        }
 
-            val envs = config.envs.toMutableMap()
-            var changed = false
+        if (dirtyConfigs.isEmpty()) return
 
-            if (envs.remove("PYCHARM_WATCHPOINT_ACTIVE") != null) {
-                changed = true
-            }
-            if (envs.remove("PYCHARM_WATCHPOINT_USER_ROOTS") != null) {
-                changed = true
-            }
-            if (envs.remove("PYDEVD_USE_CYTHON") != null) {
-                changed = true
-            }
+        com.intellij.openapi.application.WriteAction.run<Exception>{
+            for (settings in runManager.allSettings) {
+                val config = settings.configuration
+                if (config !is AbstractPythonRunConfiguration<*>) continue
 
-            val pythonPath = envs["PYTHONPATH"]
-            if (pythonPath != null && pythonPath.contains("pycharm_watchpoint_")) {
-                val cleanPath = pythonPath.split(File.pathSeparator)
-                    .filter { !it.contains("pycharm_watchpoint_") }
-                    .joinToString(File.pathSeparator)
+                val envs = config.envs.toMutableMap()
+                var changed = false
 
-                if (cleanPath.isEmpty()) {
-                    envs.remove("PYTHONPATH")
-                } else {
-                    envs["PYTHONPATH"] = cleanPath
+                if (envs.remove("PYCHARM_WATCHPOINT_ACTIVE") != null) {
+                    changed = true
                 }
-                changed = true
-            }
+                if (envs.remove("PYCHARM_WATCHPOINT_USER_ROOTS") != null) {
+                    changed = true
+                }
+                if (envs.remove("PYDEVD_USE_CYTHON") != null) {
+                    changed = true
+                }
 
-            if (changed) {
-                config.envs = envs
-                cleanedCount++
+                val pythonPath = envs["PYTHONPATH"]
+                if (pythonPath != null && pythonPath.contains("pycharm_watchpoint_")) {
+                    val cleanPath = pythonPath.split(File.pathSeparator)
+                        .filter { !it.contains("pycharm_watchpoint_") }
+                        .joinToString(File.pathSeparator)
+
+                    if (cleanPath.isEmpty()) {
+                        envs.remove("PYTHONPATH")
+                    } else {
+                        envs["PYTHONPATH"] = cleanPath
+                    }
+                    changed = true
+                }
+
+                if (changed) {
+                    config.envs = envs
+                    cleanedCount++
+                }
             }
         }
 

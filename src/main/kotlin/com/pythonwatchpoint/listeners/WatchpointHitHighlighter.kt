@@ -157,6 +157,10 @@ class WatchpointHitHighlighter(
         // it on a pooled thread; the UI work hops back to the EDT via invokeLater.
         ApplicationManager.getApplication().executeOnPooledThread {
             if (disposed) return@executeOnPooledThread
+
+            // Verify the session is still alive before the blocking eval call.
+            if (session.isStopped) return@executeOnPooledThread
+
             val expr = if (pauseFile != null && pauseLine != null) {
                 // Escape backslashes + single quotes so the file path
                 // survives as a Python string literal.

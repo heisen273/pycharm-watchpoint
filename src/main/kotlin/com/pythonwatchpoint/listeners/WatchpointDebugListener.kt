@@ -47,6 +47,16 @@ class WatchpointDebugListener(private val project: Project) : XDebuggerManagerLi
 
     override fun processStarted(debugProcess: XDebugProcess) {
         if (debugProcess !is PyDebugProcess) return
+
+        // Defensive: purge entries for dead processes that never got processStopped.
+        // This prevents unbounded accumulation if sessions crash without cleanup.
+        breakpoints.keys.removeIf { proc ->
+            runCatching { proc.session.isStopped }.getOrDefault(true)
+        }
+        highlighters.keys.removeIf { proc ->
+            runCatching { proc.session.isStopped }.getOrDefault(true)
+        }
+
         val watchpointCode = WatchpointSessionManager.getInstance(project).consumeWatchpointCode()
         if (watchpointCode == null) return
 
@@ -67,7 +77,17 @@ class WatchpointDebugListener(private val project: Project) : XDebuggerManagerLi
 
         // Give pydevd a moment to set up the evaluator, then verify/fall-back-inject.
         ApplicationManager.getApplication().executeOnPooledThread {
-            Thread.sleep(500)
+            // Retry up to 5 times with exponential backoff instead of a single
+            // fixed sleep – accommodates slow interpreters / remote debuggers.
+            var retries = 0
+            val maxRetries = 5
+            var delayMs = 300L
+            while (retries < maxRetries) {
+                Thread.sleep(delayMs)
+                if (debugProcess.evaluator != null) break
+                retries++
+                delayMs = (delayMs * 1.5).toLong()
+            }
             verifyOrInject(debugProcess, watchpointCode)
         }
     }
