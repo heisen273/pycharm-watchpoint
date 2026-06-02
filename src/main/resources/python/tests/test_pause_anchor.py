@@ -487,6 +487,103 @@ def test_handle_hit_drops_when_chain_is_entirely_library(monkeypatch):
     )
 
 
+def test_handle_hit_drops_when_anchor_frame_is_pydevd_internal(monkeypatch):
+    """A mutation whose ANCHOR frame is pydevd's own infrastructure is a
+    debugger-inspection side-effect, not a real program mutation – drop it.
+
+    Reproduces the user-reported "debugger gets stuck pausing inside
+    pydevd_utils.eval_expression, and unwatch doesn't disable it" bug.
+
+    The shape: an object/attribute watch (class surgery) is armed on a
+    request-like object whose attributes are lazily written on read (Django
+    WSGIRequest). While paused, the IDE refreshes the Variables panel / calls
+    `_pycharm_locate_watches()`; rendering the object touches a lazy attribute
+    that writes back via `__setattr__` – from INSIDE pydevd's `eval_expression`.
+    The watcher's `_find_user_caller` skips only OUR runtime frames, so it
+    hands `_handle_hit` the pydevd `eval_expression` frame as `user_frame`.
+    Real user code exists higher up the stack, so the pure-library drop gate
+    (`_find_user_code_caller is None`) does NOT catch it.
+
+    Without the fix, `_compute_bp_targets` uses `user_frame.f_code` directly as
+    the PRIMARY bp slot (only the f_back-walk fallback and the safety-net path
+    skip `_is_pydevd_internal`), so a `LineBreakpoint` lands inside
+    `pydevd_utils.py`. That bp then fires on every subsequent expression
+    pydevd evaluates – and `unwatch`, which doesn't sweep temp breakpoints,
+    can't clear it. The pause is stuck.
+
+    Correct behavior: the hit is dropped – no bp installed, nothing queued,
+    no pause armed – exactly like the pure-library-chain case.
+    """
+    import _pycharm_watchpoint as watchpoint
+
+    install_calls: list = []
+    pause_calls: list = []
+
+    def fake_install_bp(py_db, target_code, file, line, watch_name):
+        install_calls.append((file, line, watch_name))
+        return (file, line, -1)
+
+    def fake_pause(*a, **kw):
+        pause_calls.append(a)
+        return True
+
+    monkeypatch.setattr(watchpoint.pydevd_pause, "_get_pydevd_debugger", lambda: object())
+    monkeypatch.setattr(watchpoint.pydevd_pause, "_install_bp_at", fake_install_bp)
+    monkeypatch.setattr(watchpoint.pydevd_pause, "_pause_via_pydevd", fake_pause)
+    monkeypatch.setattr(watchpoint.pydevd_pause, "_pause_via_do_wait_suspend", fake_pause)
+    monkeypatch.setattr(watchpoint.pydevd_pause, "_remove_temp_breakpoints",
+                        lambda py_db, installed: None)
+
+    # Real user code sits ABOVE the pydevd frame, so the pure-library drop
+    # gate would NOT fire – the only thing that should drop this hit is the
+    # pydevd-anchor check itself.
+    user_frame = _FakeFrame(
+        "/Users/me/proj/tests/test_view.py", f_lineno=42,
+        code_lines=[42, 43, 44],
+        module_name="proj.tests.test_view",
+    )
+    # PyCharm's bundled pydevd in a Gradle-cache path: no "site-packages"
+    # segment, not under the stdlib prefix – `_is_library_filename` passes it
+    # through, but `_is_pydevd_internal` catches the `_pydevd_bundle` marker.
+    pydevd_eval_frame = _FakeFrame(
+        "/Users/me/.gradle/caches/9.5.1/transforms/abc/transformed/"
+        "pycharm-professional-2026.1-aarch64/plugins/python-ce/helpers/pydev/"
+        "_pydevd_bundle/pydevd_utils.py",
+        f_back=user_frame,
+        f_lineno=100,
+        code_lines=[100, 101, 102],
+        module_name="_pydevd_bundle.pydevd_utils",
+        name="eval_expression",
+    )
+
+    reg = builtins._watchpoint_registry
+    reg._handle_hit(
+        pydevd_eval_frame,
+        "request.user",
+        "None",
+        "<User: alice>",
+        pydevd_eval_frame.f_code.co_filename,
+        100,
+    )
+
+    assert install_calls == [], (
+        "No bp may be installed when the anchor frame is pydevd-internal. "
+        "Installing one lands it inside pydevd_utils.py, which then fires on "
+        "every subsequent expression pydevd evaluates – the 'stuck pausing in "
+        "eval_expression' bug."
+    )
+    assert pause_calls == [], (
+        "A debugger-inspection side-effect must NOT arm a pause."
+    )
+    assert reg._hit_queue == [], (
+        "A pydevd-anchored hit must NOT be queued (no phantom highlight)."
+    )
+    assert reg._temp_breakpoints == [], (
+        "A pydevd-anchored hit must NOT leave a temp breakpoint behind – "
+        "that is precisely the bp `unwatch` can't clean up."
+    )
+
+
 def test_next_code_line_finds_actual_code_line_skipping_blanks():
     """Regression for the user-reported "watchpoint hit but no pause" on
     `set_accessible_products` (user_hotel_relationship.py:195, the last

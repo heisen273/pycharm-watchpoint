@@ -1735,6 +1735,28 @@ class WatchpointRegistry:
             )
             return
 
+        # A mutation whose ANCHOR frame is pydevd's own infrastructure is a
+        # debugger-inspection side-effect, not a real program mutation. This
+        # happens when the watched object lazily writes an attribute on read
+        # (Django WSGIRequest, SimpleLazyObject, ...) while pydevd evaluates an
+        # expression to render the Variables panel / answer
+        # `_pycharm_locate_watches()`: the `__setattr__` fires from inside
+        # `pydevd_utils.eval_expression`, and `_find_user_caller` (which skips
+        # only OUR runtime frames) hands us that pydevd frame as `user_frame`.
+        # Anchoring a `LineBreakpoint` there lands it inside pydevd_utils.py,
+        # where it then fires on EVERY subsequent expression pydevd evaluates –
+        # and `unwatch` (which doesn't sweep temp breakpoints) can't clear it.
+        # The pure-library drop gate below doesn't catch this because real user
+        # code usually sits higher up the suspended thread's stack. Drop it.
+        if _is_pydevd_internal(user_frame.f_code.co_filename):
+            _log_warn(
+                f"_handle_hit: anchor frame is pydevd-internal "
+                f"({user_frame.f_code.co_filename}:{user_frame.f_lineno}) for "
+                f"{watch_name!r}; dropping hit (debugger-inspection side-effect, "
+                f"not a real mutation)."
+            )
+            return
+
         # Declared up-front for both exception branches below (Python
         # rejects multiple `global` declarations in the same function).
         global _pydevd_last_error

@@ -62,7 +62,7 @@ except Exception:
 # a bug we can confirm from /tmp/pythonwatchpoint.log which version of
 # the runtime is actually loaded in their session – distinguishing
 # "my fix didn't help" from "you're running an older bundled copy."
-_RUNTIME_VERSION = "2026-06-02-locate-watches-cross-frame-v27"
+_RUNTIME_VERSION = "2026-06-03-drop-pydevd-anchored-hit-v28"
 
 
 def _is_pydevd_internal(filename: str) -> bool:

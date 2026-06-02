@@ -151,6 +151,8 @@ When `__setattr__` fires from inside framework code (Django `QuerySet._clone`, S
 
 If the entire chain is library/runtime (no user code in `_MAX_FRAME_WALK_HOPS` hops) → hit is **silently dropped**. A phantom highlight with no pause is worse UX than no signal.
 
+**Pydevd-internal anchor drop (v28):** if the anchor frame (`user_frame`) is itself `_is_pydevd_internal`, `_handle_hit` drops the hit. This is a debugger-inspection side-effect, not a real mutation: an object/attribute watch (class surgery) on a lazily-populated object (Django `WSGIRequest`, `SimpleLazyObject`) fires its `__setattr__` while pydevd's `eval_expression` renders the Variables panel / answers `_pycharm_locate_watches()`. `_find_user_caller` skips only the runtime, so it hands `_handle_hit` the pydevd frame, and the pure-library drop gate above doesn't catch it because real user code sits higher on the suspended thread's stack. Without the drop, `_compute_bp_targets` anchors the **primary** bp on `user_frame.f_code` (only the f_back-walk fallback + safety-net skip pydevd-internal), installing a `LineBreakpoint` inside `pydevd_utils.py` that then fires on every later eval – and `unwatch` (no temp-bp sweep) can't clear it. Symptom: debugger stuck pausing in `eval_expression`, surviving unwatch. Pinned by `test_handle_hit_drops_when_anchor_frame_is_pydevd_internal`.
+
 ### §13 Pause mechanism – pydevd `LineBreakpoint` (primary)
 The primary pause is `_install_pause_breakpoint`, NOT `_pause_via_pydevd` (the CMD_STEP_OVER approach is unreliable in PEP 669 mode for frames whose `py_start_callback` decided "no LINE tracing" at first entry).
 
