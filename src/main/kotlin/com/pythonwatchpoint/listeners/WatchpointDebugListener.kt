@@ -57,9 +57,11 @@ class WatchpointDebugListener(private val project: Project) : XDebuggerManagerLi
             runCatching { proc.session.isStopped }.getOrDefault(true)
         }
 
-        val watchpointPackage = WatchpointSessionManager.getInstance(project).consumeWatchpointPackage()
+        val sessionManager = WatchpointSessionManager.getInstance(project)
+        val watchpointPackage = sessionManager.consumeWatchpointPackage()
         if (watchpointPackage == null) return
 
+        sessionManager.markActive(debugProcess)
         logger.warn("=== WATCHPOINT SESSION STARTED ===")
 
         // Drop any watched paths inherited from a previous session – otherwise
@@ -94,6 +96,7 @@ class WatchpointDebugListener(private val project: Project) : XDebuggerManagerLi
 
     override fun processStopped(debugProcess: XDebugProcess) {
         (debugProcess as? PyDebugProcess)?.let { injected.remove(it) }
+        WatchpointSessionManager.getInstance(project).markInactive(debugProcess)
         removeWatchpointHitBreakpoint(debugProcess)
         detachHitHighlighter(debugProcess)
     }

@@ -20,6 +20,7 @@ import com.jetbrains.python.debugger.PyStackFrame
 import com.pythonwatchpoint.listeners.WatchpointFrameSync
 import com.pythonwatchpoint.listeners.WatchpointTreeCellRenderer
 import com.pythonwatchpoint.services.WatchpointMarkerService
+import com.pythonwatchpoint.services.WatchpointSessionManager
 import java.util.LinkedList
 
 /**
@@ -76,8 +77,13 @@ class AddWatchpointAction : AnAction() {
             e.presentation.isEnabledAndVisible = false
             return
         }
-        val service = WatchpointMarkerService.getInstance(project)
         val session = XDebuggerManager.getInstance(project).currentSession
+        val debugProcess = session?.debugProcess
+        if (debugProcess == null || !WatchpointSessionManager.getInstance(project).isActiveWatchpointSession(debugProcess)) {
+            e.presentation.isEnabledAndVisible = false
+            return
+        }
+        val service = WatchpointMarkerService.getInstance(project)
         val labelFrameId: Long? = try {
             (session?.currentStackFrame as? PyStackFrame)?.frameId?.toLongOrNull()
         } catch (e: Exception) { null }
