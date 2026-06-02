@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 20 20">
   <g transform="translate(0.5, 0.5) scale(2.375)">
-    <path fill="#555555" d="M5,3 5,4 7,4 7,3 M1,3 1,4 3,4 3,3 M5,5 4,4 3,5 0,5 0,2 8,2 8,5"/>
+    <path fill="#EE7A30" d="M5,3 5,4 7,4 7,3 M1,3 1,4 3,4 3,3 M5,5 4,4 3,5 0,5 0,2 8,2 8,5"/>
   </g>
 </svg>
