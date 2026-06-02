@@ -2,6 +2,7 @@ package com.pythonwatchpoint.actions
 
 import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.AnActionEvent
+import com.intellij.openapi.actionSystem.DataContext
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
@@ -65,7 +66,7 @@ class AddWatchpointAction : AnAction() {
      */
     override fun update(e: AnActionEvent) {
         val project = e.project
-        val nodes = XDebuggerTreeActionBase.getSelectedNodes(e.dataContext)
+        val nodes = getSelectedNodes(e.dataContext)
         if (project == null || nodes.isEmpty()) {
             e.presentation.isEnabledAndVisible = false
             return
@@ -109,7 +110,7 @@ class AddWatchpointAction : AnAction() {
 
     override fun actionPerformed(e: AnActionEvent) {
         val project = e.project ?: return
-        val nodes = XDebuggerTreeActionBase.getSelectedNodes(e.dataContext)
+        val nodes = getSelectedNodes(e.dataContext)
         if (nodes.isEmpty()) return
 
         val session = XDebuggerManager.getInstance(project).currentSession ?: return
@@ -404,6 +405,34 @@ class AddWatchpointAction : AnAction() {
         return parts.joinToString(".")
     }
 
+
+    /**
+     * Reflective wrapper for XDebuggerTreeActionBase.getSelectedNodes.
+     *
+     * The method changed shape across builds: Kotlin companion function (2023.3,
+     * 2026.1+) vs. plain Java static (2025.x). A direct Kotlin call compiles to
+     * Companion-field access bytecode that throws NoSuchFieldError on builds where
+     * the companion was removed. We probe both shapes so every build in sinceBuild..
+     * untilBuild works without a compile-time dependency on the exact class shape.
+     */
+    private fun getSelectedNodes(dataContext: DataContext): List<XValueNodeImpl> {
+        // 2025.x path: plain static method on the class itself
+        runCatching {
+            val m = XDebuggerTreeActionBase::class.java
+                .getMethod("getSelectedNodes", DataContext::class.java)
+            @Suppress("UNCHECKED_CAST")
+            return (m.invoke(null, dataContext) as? List<XValueNodeImpl>) ?: emptyList()
+        }
+        // 2023.3 / 2026.1+ path: Kotlin companion object holds the method
+        return runCatching {
+            val f = XDebuggerTreeActionBase::class.java.getDeclaredField("Companion")
+            f.isAccessible = true
+            val companion = f.get(null)
+            val m = companion.javaClass.getMethod("getSelectedNodes", DataContext::class.java)
+            @Suppress("UNCHECKED_CAST")
+            (m.invoke(companion, dataContext) as? List<XValueNodeImpl>) ?: emptyList()
+        }.getOrDefault(emptyList())
+    }
 
     /**
      * Show an IDE error balloon for watchpoint failures.
