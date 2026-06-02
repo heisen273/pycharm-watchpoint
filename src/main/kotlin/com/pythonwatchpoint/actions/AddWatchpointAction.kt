@@ -16,6 +16,7 @@ import com.intellij.xdebugger.impl.ui.tree.nodes.XValueNodeImpl
 import com.jetbrains.python.debugger.PyDebugProcess
 import com.jetbrains.python.debugger.PyDebugValue
 import com.jetbrains.python.debugger.PyStackFrame
+import com.pythonwatchpoint.listeners.WatchpointFrameSync
 import com.pythonwatchpoint.listeners.WatchpointTreeCellRenderer
 import com.pythonwatchpoint.services.WatchpointMarkerService
 import java.util.LinkedList
@@ -79,16 +80,17 @@ class AddWatchpointAction : AnAction() {
         val labelFrameId: Long? = try {
             (session?.currentStackFrame as? PyStackFrame)?.frameId?.toLongOrNull()
         } catch (e: Exception) { null }
-        // Mirror the three-pronged watched check from WatchpointTreeCellRenderer so that
-        // the menu label agrees with what the icon shows:
-        //   1. Frame-scoped marker (works when paused in the same frame the watch was armed)
-        //   2. Name-only marker fallback (works for rebind-only watches like Django model
-        //      `obj` where __class__ surgery is refused — same expression name, different frame)
-        //   3. Type-sniff on the node's PyDebugValue (works for __class__-surgery watches
-        //      like `request` travelling through middleware frames)
+        // Mirror the object/frame-bound watched check from WatchpointTreeCellRenderer so
+        // the menu label always agrees with what the icon shows (a row with no icon must
+        // never read "Remove Watchpoint"):
+        //   1. Frame-scoped marker (works when paused in the same frame the watch was armed,
+        //      or a frame a hit fired in — the hit highlighter registers those).
+        //   2. Type-sniff on the node's PyDebugValue (works for __class__-surgery watches
+        //      like `request` travelling through middleware frames).
+        // Deliberately NO name-only fallback — see WatchpointTreeCellRenderer for why
+        // name matching cannot be made ghost-free with (name, frameId) markers alone.
         fun isNodeWatched(path: String, node: XValueNodeImpl): Boolean {
             if (labelFrameId != null && service.isWatched(path, labelFrameId)) return true
-            if (service.isWatched(path)) return true
             val pyType = (node.valueContainer as? PyDebugValue)?.type ?: return false
             return pyType.startsWith("_Watched")
         }
@@ -135,16 +137,17 @@ class AddWatchpointAction : AnAction() {
             (currentFrame as? PyStackFrame)?.frameId?.toLongOrNull()
         } catch (e: Exception) { null }
 
-        // Three-pronged check matching update() and WatchpointTreeCellRenderer:
-        //   1. Frame-scoped marker: exact frame the watch was armed against.
-        //   2. Name-only marker: catches rebind-only watches (Django models) where
-        //      __class__ surgery was refused and the hit fires in a callee frame
-        //      that also has the variable in scope with the same name.
-        //   3. Type-sniff: catches __class__-surgery watches (request, etc.) where
-        //      the object's type has been mutated to _WatchedAny* by watchpoint.py.
+        // Object/frame-bound check matching update() and WatchpointTreeCellRenderer so
+        // the toggle decision agrees with the label the user clicked:
+        //   1. Frame-scoped marker: the frame the watch was armed against (or a frame a
+        //      hit fired in — registered by the hit highlighter).
+        //   2. Type-sniff: __class__-surgery watches (request, etc.) whose type was
+        //      mutated to _WatchedAny* by watchpoint.py — travels across frames.
+        // No name-only fallback (see WatchpointTreeCellRenderer): keeps label and action
+        // consistent and avoids the ghost-icon ambiguity. Remove still works regardless,
+        // since `_pycharm_unwatch` keys by expression string.
         fun isWatchedHere(expr: String, node: XValueNodeImpl): Boolean {
             if (currentFrameId != null && service.isWatched(expr, currentFrameId)) return true
-            if (service.isWatched(expr)) return true
             val pyType = (node.valueContainer as? PyDebugValue)?.type ?: return false
             return pyType.startsWith("_Watched")
         }
@@ -221,6 +224,13 @@ class AddWatchpointAction : AnAction() {
                     // `_WatchedAny_<Class>` wrapper instead of the original cached `<Class>`.
                     refreshVariablesView(project)
                 }
+                // Scan the whole paused stack now so the icon lights up in the
+                // caller ("past") frames already on the wall – arming doesn't
+                // fire sessionPaused, so without this they'd stay un-iconed until
+                // the next step. decorateNode above only marks the armed frame.
+                WatchpointFrameSync.refresh(
+                    project, debugProcess, WatchpointMarkerService.getInstance(project),
+                )
             }
             override fun errorOccurred(errorMessage: String) {
                 logger.warn("Failed to arm watchpoint '$fullPath': $errorMessage")
@@ -260,6 +270,11 @@ class AddWatchpointAction : AnAction() {
                     // `_WatchedAny_<Class>` snapshot from before unwatch.
                     refreshVariablesView(project)
                 }
+                // Re-scan the stack so the icon is dropped from every frame the
+                // removed watch had lit up, not just the row clicked.
+                WatchpointFrameSync.refresh(
+                    project, debugProcess, WatchpointMarkerService.getInstance(project),
+                )
             }
             override fun errorOccurred(errorMessage: String) {
                 logger.warn("Failed to remove watchpoint '$fullPath': $errorMessage")

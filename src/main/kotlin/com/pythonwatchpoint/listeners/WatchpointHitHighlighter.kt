@@ -117,6 +117,13 @@ class WatchpointHitHighlighter(
         if (disposed) return
         val debugProcess = session.debugProcess as? PyDebugProcess ?: return
 
+        // Independent of the hit-highlight logic below: refresh the cross-frame
+        // watch set so the Variables-panel icon follows each watched object
+        // (by identity) into caller/callee frames, not just the frame it was
+        // armed in. Runs on every pause/step so the icons track as the user
+        // moves through the stack.
+        syncWatchedFrames(debugProcess)
+
         // Snapshot the current pause location on the EDT before hopping off
         // for the synchronous evaluator call. The Python side filters its
         // hit queue by `(pause_file, pause_line)` so each pause returns
@@ -247,6 +254,17 @@ class WatchpointHitHighlighter(
                 }, 150)
             }
         }
+    }
+
+    /**
+     * Refresh the cross-frame watch set on every pause/step. Delegates to the
+     * shared [WatchpointFrameSync] (also driven by the arm/remove action) so the
+     * icons track the watched object across the whole stack as the user moves.
+     * The `disposed` guard is threaded through so a late callback after session
+     * teardown neither evaluates nor repaints.
+     */
+    private fun syncWatchedFrames(debugProcess: PyDebugProcess) {
+        WatchpointFrameSync.refresh(project, debugProcess, markerService) { disposed }
     }
 
     override fun sessionResumed() {

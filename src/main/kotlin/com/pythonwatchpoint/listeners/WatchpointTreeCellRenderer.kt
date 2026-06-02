@@ -35,11 +35,19 @@ import javax.swing.tree.TreeCellRenderer
  * colour wins – the alternative (overriding both selection colour AND
  * watchpoint colour) reads as a clash on most themes.
  *
- * Matching: the row's XValueNode is mapped to its full dotted path
- * (`request.user.email`) and compared against [WatchpointMarkerService] by
- * equality. Watching `request.user.email` therefore highlights only the leaf
- * `email` node (when the user has expanded the chain to it) – not its
- * ancestors `request` and `user`, which keep their normal rendering.
+ * Matching is object/frame-bound, never name-only, so a fresh same-named object
+ * (e.g. the `request` of a new web request) is not decorated. A row is treated
+ * as watched iff EITHER its `(name, id(frame))` is registered in
+ * [WatchpointMarkerService] for the frame currently shown, OR its
+ * `PyDebugValue.type` carries the runtime's `_Watched*` class-surgery marker
+ * (which travels with the object across frames). See
+ * [getTreeCellRendererComponent] for why a name-only fallback is intentionally
+ * absent – it cannot distinguish "same watched object, other frame" from "new
+ * object, same name", which was the source of the ghost-icon bug.
+ *
+ * Watching `request.user.email` therefore highlights only the leaf `email` node
+ * (when the user has expanded the chain to it) – not its ancestors `request`
+ * and `user`, which keep their normal rendering.
  */
 class WatchpointTreeCellRenderer(
     private val delegate: TreeCellRenderer,
@@ -70,46 +78,43 @@ class WatchpointTreeCellRenderer(
         val fullPath = computeFullPath(value)
         if (fullPath.isEmpty()) return component
 
-        // Three independent ways to conclude this row is watched. Any one is sufficient.
+        // Two object/frame-bound ways to conclude this row is watched. Either is
+        // sufficient. Both are immune to the "ghost icon" bug because neither matches
+        // purely by variable name — they bind to the specific frame instance or the
+        // specific mutated object.
         //
         // Path 1 — frame-scoped marker lookup:
-        // The armed frame's id() was stored in WatchpointMarkerService when the user
-        // clicked "Add Watchpoint". Works when the renderer is showing the exact frame
-        // the watch was armed in (most local-variable watch scenarios).
+        // The armed frame's id() (== pydevd's frameId, see resolveFrameId) was stored in
+        // WatchpointMarkerService when the user clicked "Add Watchpoint", and the hit
+        // highlighter additionally registers each fired watch against the live paused
+        // frame. Matches only when the renderer is showing one of those exact frames —
+        // covers local-variable watches and rebind-only watches in the frame the user is
+        // actually paused in. A new same-named object lives in a different frame (new
+        // id()), so a stale entry can never light it up.
         //
         // Path 2 — runtime type sniffing:
         // When watchpoint.py arms an attribute watch it does __class__ surgery on the
         // object, replacing its class with a generated subclass whose __name__ starts
         // with "_Watched" (_WatchedAnyAttrSubclass, _WatchedSubclass, _WatchedList,
         // _WatchedDict, _WatchedSet). PyDebugValue.type is type(obj).__name__ from
-        // the pydevd wire protocol — free to read, no extra IPC. This covers `request`
-        // and any other object travelling through frames where the armed frameId won't
-        // match the current paused frameId.
+        // the pydevd wire protocol — free to read, no extra IPC. The mutated type travels
+        // with the object into every frame, so this covers `request` and any other
+        // class-surgery watch regardless of which frame the renderer is showing. A fresh,
+        // unwatched object keeps its plain type, so this never produces a ghost either.
         //
-        // Path 3 — name-only marker fallback:
-        // Covers rebind-only watches (e.g. a Django Model where __class__ surgery was
-        // refused by the metaclass). The type stays plain "Subscription" so Path 2
-        // misses it, and the hit fires in a callee frame (e.g. set_attributes) so the
-        // frame-scoped Path 1 also misses. The name-only check catches it because the
-        // armed expression is in the marker service regardless of frame.
+        // We deliberately do NOT fall back to a name-only marker lookup. With only
+        // (name, frameId) markers a name-only match cannot distinguish "the same watched
+        // object shown in another frame" from "a different new object with the same name"
+        // — that ambiguity is exactly the ghost-icon bug. When the frame id can't be
+        // resolved (rare teardown/race) we show no icon rather than guess by name; the
+        // next repaint corrects it.
         val frameId = resolveFrameId(tree)
-        val isWatchedByMarker = if (frameId != null) {
-            markerService.isWatched(fullPath, frameId)
-        } else {
-            markerService.isWatched(fullPath)
-        }
+        val isWatchedByMarker = frameId != null && markerService.isWatched(fullPath, frameId)
         val isWatchedByType = (value.valueContainer as? PyDebugValue)
             ?.type
             ?.startsWith("_Watched")
             ?: false
-        // Third prong: name-only marker lookup. Covers rebind-only watches (e.g. a Django
-        // Model where __class__ surgery was refused by the metaclass) — the type stays
-        // plain "Subscription" so isWatchedByType misses it, and the hit fires in a callee
-        // frame (set_attributes) so the frame-scoped isWatchedByMarker also misses. The
-        // name-only check catches it because the armed expression (e.g. "obj") appears
-        // in the marker service regardless of which frame the renderer is currently showing.
-        val isWatchedByName = markerService.isWatched(fullPath)
-        if (!isWatchedByMarker && !isWatchedByType && !isWatchedByName) return component
+        if (!isWatchedByMarker && !isWatchedByType) return component
         decorate(component, selected)
         return component
     }

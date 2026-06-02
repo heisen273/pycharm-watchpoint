@@ -39,7 +39,9 @@ src/main/kotlin/com/pythonwatchpoint/
 ├── listeners/
 │   ├── WatchpointDebugListener.kt     # processStarted/processStopped hooks
 │   ├── WatchpointHitHighlighter.kt    # Per-session: line highlight + pulse + inline hint on hit
-│   └── WatchpointTreeCellRenderer.kt  # Wraps Variables-panel cell renderer to mark watched rows
+│   ├── WatchpointTreeCellRenderer.kt  # Wraps Variables-panel cell renderer to mark watched rows
+│   ├── WatchpointFrameSync.kt         # Per-pause + on-arm cross-frame watch sync (object identity)
+│   └── WatchpointUiUtil.kt            # Reflective Variables-tree lookup + split-mode detection
 ├── actions/
 │   ├── DebugWithWatchpointAction.kt   # Toolbar: clone run config + inject
 │   └── AddWatchpointAction.kt         # Variables-panel right-click
@@ -205,19 +207,33 @@ import com.intellij.openapi.editor.ex.RangeHighlighterEx
 
 No-arg `Alarm()` is deprecated in 2025.1. Use `Alarm(project)` so the alarm is cleaned up automatically when the project closes.
 
-### WatchpointMarkerService – frame-scoped keys
+### WatchpointMarkerService – frame-scoped keys + cross-frame synced set
 
-Watches are stored as `WatchKey(expression: String, frameId: Long)` where `frameId` is the Python `id(frame)` returned by `watch_at()`. This prevents a watch on `"self"` from lighting up every row named `"self"` across all threads and stack frames.
+Watches are stored as `WatchKey(expression: String, frameId: Long)` where `frameId` is the Python `id(frame)` returned by `watch_at()` (== pydevd's `PyStackFrame.frameId`, confirmed via pydevd `find_frame`: `if lookingFor == id(frame)`). This prevents a watch on `"self"` from lighting up every row named `"self"` across all threads and stack frames.
 
-`add(expression, frameId)` – arm; also increments `expressionCounts[expression]`.  
-`remove(expression)` – disarm (by expression only; frameId not needed on remove); clears the count entry.  
-`isWatched(expression, frameId)` – exact match (set lookup).  
-`isWatched(expression)` – O(1) via `expressionCounts` map; name-only fallback for rebind-only watches where the frame id has changed.
+Two independent sets:
+- **`watched`** – user-armed entries. `add(expression, frameId)` arms; `remove(expression)` disarms by expression only (the frame is already gone by remove time). Persistent until unwatch / session start, so a freshly-armed row keeps its icon the instant it's armed, before any sync runs.
+- **`syncedFrames`** – the authoritative cross-frame set, **replaced wholesale** by `replaceSynced(set)` from a successful `_pycharm_locate_watches()` read (see [WatchpointFrameSync](#watchpointframesync--cross-frame-icon-by-object-identity)). Never touched on a failed/`ERROR:` read, so a transient evaluator hiccup can't wipe icons.
 
-The `WatchpointTreeCellRenderer` and `AddWatchpointAction.update()` use a three-pronged check:
-1. Frame-scoped marker (`isWatched(path, frameId)`) – exact frame.
-2. Name-only fallback (`isWatched(path)`) – Django model rebind-only watches.
-3. Type-sniff on `PyDebugValue.type.startsWith("_Watched")` – class-surgery watches travelling through middleware frames.
+`isWatched(expression, frameId)` returns true if the key is in **either** set. `clear()` (called on `processStarted`) clears both. There is **no** name-only `isWatched(expression)` lookup any more – it was removed (along with the unused `expressionCounts` index) because name-only matching can't tell "same watched object, other frame" from "new object, same name" (the ghost-icon bug). All matching is `(expression, frameId)` or type-sniff.
+
+The `WatchpointTreeCellRenderer` and `AddWatchpointAction` use a **two-pronged, object/frame-bound** check (NOT name-only):
+1. Frame-scoped marker (`isWatched(path, frameId)`) – matches armed OR synced entries for the frame currently shown.
+2. Type-sniff on `PyDebugValue.type.startsWith("_Watched")` – class-surgery watches, whose mutated type travels with the object into every frame.
+
+### WatchpointFrameSync – cross-frame icon by object identity
+
+The icon follows the watched **object** (by `id()`) into caller/callee frames, not just the frame it was armed in – without the ghost that the old name-only fallback caused. The runtime answers the identity question (Kotlin can't: `PyDebugValue` carries no Python `id()`).
+
+`WatchpointFrameSync.refresh(project, debugProcess, markerService, isCancelled)`:
+- Off-EDT (pooled thread), evaluates `_pycharm_locate_watches()` (full payload, `doTrunc=false`), which returns every live `(name, id(frame))` pair across the whole stack (live `_local_watches` keys + an identity scan of `sys._current_frames()` for `_AttributeWatch._obj_ref` objects).
+- **Replace-on-success-only**: parses, calls `markerService.replaceSynced(...)`, then repaints the current tree via `WatchpointUiUtil.currentVariablesTree`. Skips silently on eval exception / `ERROR:` prefix / malformed base64 → never wipes. Empty payload is trusted ("nothing watched").
+
+Driven from two places, both while paused:
+- `WatchpointHitHighlighter.sessionPaused` – every pause/step (passes `{ disposed }` as `isCancelled`).
+- `AddWatchpointAction` arm **and** remove callbacks – **the instant a watch is (un)armed**. Arming doesn't fire `sessionPaused`, so without this the caller ("past") frames already on the stack wouldn't get the icon until the next step. `decorateNode` alone only marks the armed frame.
+
+This is the **safe** version of the previously-failed evaluator sync (the old attempt wiped Kotlin state on a single eval timeout). Payload encoding: base64 of UTF-8, records separated by U+0001, each record `name`+U+0000+`frameId` (mirrors the hit-payload convention).
 
 ### Stale WatchpointHit breakpoint cleanup
 
@@ -305,11 +321,15 @@ On every `sessionPaused`, queries `_pycharm_consume_last_hit()` – returns base
 
 ## Variables-panel highlighting
 
-`WatchpointMarkerService` – project-scoped service holding armed watch expressions keyed by `(expression, frameId)`. Cleared on `processStarted` to prevent ghost-highlighting from previous sessions. Uses a secondary `expressionCounts` index (`ConcurrentHashMap<String, Int>`) for O(1) name-only lookups – avoids linear scan on every Variables-panel cell paint.
+`WatchpointMarkerService` – project-scoped service holding two `(expression, frameId)` sets (armed + synced; see [above](#watchpointmarkerservice--frame-scoped-keys--cross-frame-synced-set)). Cleared on `processStarted` to prevent ghost-highlighting from previous sessions.
 
-`WatchpointTreeCellRenderer` – wraps the default renderer. Installed lazily on first watch arm (idempotent via instanceof check). For each cell, computes the row's full dotted path and checks via the three-pronged `isWatched` logic (frame-scoped → name-only → type-sniff); if matched:
+`WatchpointTreeCellRenderer` – wraps the default renderer. Installed lazily on first watch arm (idempotent via instanceof check). For each cell, computes the row's full dotted path and checks via the **two-pronged** `isWatched` logic (frame-scoped marker incl. synced cross-frame entries → type-sniff). **No name-only fallback** – that was the ghost-icon bug. If matched:
 - Swaps icon to `WatchpointIcons.Watch` (always, even on selected rows).
 - Tints background pale yellow – **only when NOT selected** (selection colour wins on selected rows).
+
+Cross-frame coverage (the icon following the object into caller/callee frames) comes from `WatchpointFrameSync` repopulating the synced set on every pause and on arm/remove – the renderer itself stays a pure, name-agnostic painter.
+
+**Why the tree renderer survives steps**: the main Variables tree is *reused* across step / frame-switch – `XDebuggerTree` calls `setCellRenderer(...)` once in its constructor; `XVariablesViewBase` keeps one tree and only `setRoot(...)`s on frame change. So a one-time install persists (the earlier "PyCharm rebuilds the tree, orphaning our renderer" theory is wrong for the main panel; genuinely-new trees only appear for detached/split tabs and the Watches view).
 
 ## Custom icons
 

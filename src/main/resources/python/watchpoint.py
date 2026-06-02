@@ -3169,7 +3169,7 @@ except Exception:
 # a bug we can confirm from /tmp/pythonwatchpoint.log which version of
 # the runtime is actually loaded in their session – distinguishing
 # "my fix didn't help" from "you're running an older bundled copy."
-_RUNTIME_VERSION = "2026-06-01-pydevd-internal-filter-v26"
+_RUNTIME_VERSION = "2026-06-02-locate-watches-cross-frame-v27"
 
 
 def _is_pydevd_internal(filename: str) -> bool:
@@ -4463,6 +4463,112 @@ def _pycharm_consume_last_hit(pause_file: Optional[str] = None,
     return ";".join(encoded_hits)
 
 
+# Soft cap on the number of (name, frame_id) pairs `_pycharm_locate_watches`
+# returns, so a pathological stack (deep recursion holding a watched object in
+# every frame) can't produce an unbounded payload. Far above any realistic
+# count of frames that legitimately reference a watched object.
+_MAX_LOCATE_PAIRS = 5000
+
+
+def _pycharm_locate_watches() -> str:
+    """Report every (variable name, frame id) pair where an armed watch is
+    live RIGHT NOW, across all threads' stack frames.
+
+    The IDE plugin calls this on each `sessionPaused` to drive the
+    Variables-panel watch icon across the whole call stack. The result is
+    authoritative and frame-scoped, so the icon follows the watched OBJECT
+    (by identity) into caller and callee frames without ever lighting up an
+    unrelated, same-named variable – the failure mode of the old name-only
+    fallback (the "ghost icon" bug).
+
+    Two sources of (name, frame_id):
+      1. Every live `_local_watches` key – the armed frame plus any callee
+         frames a watch propagated INTO (design contract §8). These are
+         auto-pruned on frame exit, so the set is always live.
+      2. Identity scan: for each watched OBJECT (the `_AttributeWatch`
+         referents – bare-object and dotted-attribute watches), walk every
+         live frame and emit `(local_name, id(frame))` for any local bound to
+         that exact object by `id()`. This is what carries the icon into
+         caller frames the watch never propagated into – e.g. a `request`
+         held by a middleware frame above the one the user armed in.
+
+    Side-effect free: it only reads `id()` and iterates `f_locals` – it never
+    touches a watched object's attributes, so no watcher `__setattr__` /
+    `__getattribute__` override can fire during the scan.
+
+    Encoding mirrors `_pycharm_consume_last_hit`: base64 of UTF-8, records
+    separated by `\\x01`, each record `name\\x00frameid`. Empty string ⇒ no
+    live watches (authoritative – the plugin may safely clear its cross-frame
+    set). An `ERROR:`-prefixed string signals an internal failure so the
+    plugin can leave its existing state untouched rather than wipe it on a
+    transient hiccup.
+    """
+    try:
+        reg = _registry
+        pairs: set = set()          # (name, frame_id) to emit
+        watched_ids: dict = {}      # id(obj) -> obj, the watched objects
+
+        # Snapshot registry state under the lock; release before the frame
+        # scan so we don't hold `_lock` across a potentially deep stack walk
+        # (the scan touches no registry state, so it needs no lock).
+        with reg._lock:
+            for (name, fid) in reg._local_watches.keys():
+                pairs.add((name, int(fid)))
+            for aw in list(reg._attr_watches.values()):
+                ref = getattr(aw, "_obj_ref", None)
+                if ref is None:
+                    continue
+                try:
+                    obj = ref()
+                except Exception:
+                    obj = None
+                if obj is not None:
+                    watched_ids[id(obj)] = obj
+
+        # Identity scan: find every live local bound to a watched object.
+        if watched_ids:
+            try:
+                frames = list(sys._current_frames().values())
+            except Exception:
+                frames = []
+            for top in frames:
+                if len(pairs) >= _MAX_LOCATE_PAIRS:
+                    break
+                f = top
+                hops = _MAX_FRAME_WALK_HOPS
+                while f is not None and hops > 0:
+                    hops -= 1
+                    try:
+                        co_filename = f.f_code.co_filename
+                    except Exception:
+                        co_filename = ""
+                    # Skip our own runtime frames (the eval shim, <string>).
+                    if co_filename not in _RUNTIME_FILENAMES:
+                        try:
+                            local_items = list(f.f_locals.items())
+                        except Exception:
+                            local_items = []
+                        fid = id(f)
+                        for nm, val in local_items:
+                            try:
+                                if id(val) in watched_ids:
+                                    pairs.add((nm, fid))
+                            except Exception:
+                                continue
+                        if len(pairs) >= _MAX_LOCATE_PAIRS:
+                            break
+                    f = f.f_back
+
+        if not pairs:
+            return ""
+        import base64 as _b64
+        records = ["%s\x00%d" % (nm, fid) for (nm, fid) in pairs]
+        raw = "\x01".join(records).encode("utf-8")
+        return _b64.b64encode(raw).decode("ascii")
+    except Exception as e:
+        return "ERROR: locate_watches failed: %s" % (e,)
+
+
 # Expose via builtins so PyCharm plugin can call them without importing.
 builtins._pycharm_watch = watch
 builtins._pycharm_watch_at = watch_at
@@ -4470,6 +4576,7 @@ builtins._pycharm_unwatch = unwatch
 builtins._pycharm_clear_watches = clear_watches
 builtins._pycharm_watchpoint_diag = _pycharm_watchpoint_diag
 builtins._pycharm_consume_last_hit = _pycharm_consume_last_hit
+builtins._pycharm_locate_watches = _pycharm_locate_watches
 
 
 # Fingerprint line: when the user reports "I rebuilt and it still doesn't

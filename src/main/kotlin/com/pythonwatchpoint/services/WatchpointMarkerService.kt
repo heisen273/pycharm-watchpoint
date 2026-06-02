@@ -35,11 +35,20 @@ class WatchpointMarkerService {
      */
     data class WatchKey(val expression: String, val frameId: Long)
 
-    // Secondary index: expression -> count of entries with that expression.
-    // Enables O(1) name-only lookup instead of linear scan on every cell paint.
-    private val expressionCounts = ConcurrentHashMap<String, Int>()
-
     private val watched: MutableSet<WatchKey> =
+        Collections.newSetFromMap(ConcurrentHashMap<WatchKey, Boolean>())
+
+    // Cross-frame "synced" set: the authoritative (expression, frameId) pairs
+    // where each armed watch is live RIGHT NOW, across the whole call stack.
+    // Replaced wholesale by [replaceSynced] from a successful read of the
+    // runtime's `_pycharm_locate_watches()` on each pause; never touched on a
+    // failed/timed-out read, so a transient evaluator hiccup can't wipe icons.
+    //
+    // Kept separate from [watched] (the user-armed entries) so a freshly-armed
+    // watch keeps its icon the instant it's armed – before the first sync runs
+    // – and so a too-narrow sync result can never drop an armed entry. The
+    // renderer treats a row as watched if it appears in EITHER set.
+    private val syncedFrames: MutableSet<WatchKey> =
         Collections.newSetFromMap(ConcurrentHashMap<WatchKey, Boolean>())
 
     /**
@@ -47,41 +56,45 @@ class WatchpointMarkerService {
      * (the Python `id(frame)` returned by `watch_at`).
      */
     fun add(expression: String, frameId: Long) {
-            if (watched.add(WatchKey(expression, frameId))) {
-                expressionCounts.merge(expression, 1, Int::plus)
-            }
-        }
+        watched.add(WatchKey(expression, frameId))
+    }
+
     /**
      * Disarm the watch for `expression` regardless of which frame it was
      * registered against. Called from the Remove path where we only have the
      * expression string — the frame has already been cleaned up by the runtime.
      */
     fun remove(expression: String) {
-        val removed = watched.removeIf { it.expression == expression }
-        if (removed) {
-            expressionCounts.remove(expression)
-        }
+        watched.removeIf { it.expression == expression }
     }
 
     /**
      * Return true iff `expression` is watched in the frame identified by
-     * `frameId`. This is the renderer's hot path — O(1) set lookup.
+     * `frameId` — either as a user-armed entry or as a cross-frame entry from
+     * the latest runtime sync. This is the renderer's hot path — O(1) set
+     * lookup against two concurrent sets.
      */
-    fun isWatched(expression: String, frameId: Long): Boolean =
-        WatchKey(expression, frameId) in watched
+    fun isWatched(expression: String, frameId: Long): Boolean {
+        val key = WatchKey(expression, frameId)
+        return key in watched || key in syncedFrames
+    }
 
     /**
-     * Return true iff `expression` is watched in ANY frame. Used only by
-     * [AddWatchpointAction.update] to decide the context-menu label; do NOT
-     * use this from the renderer (it's the source of the original bug).
+     * Replace the cross-frame synced set wholesale with `newSet`. Called only
+     * after a successful read of `_pycharm_locate_watches()` from the runtime,
+     * so the icons reflect exactly where each watch is currently live. Must
+     * NOT be called on a failed/empty-due-to-error read — pass the genuinely
+     * computed set (which may legitimately be empty when nothing is watched).
      */
-    fun isWatched(expression: String): Boolean =
-        watched.any { it.expression == expression }
+    fun replaceSynced(newSet: Set<WatchKey>) {
+        syncedFrames.clear()
+        syncedFrames.addAll(newSet)
+    }
 
     /** Drop all entries. Called on session start so stale watches don't leak across runs. */
     fun clear() {
         watched.clear()
-        expressionCounts.clear()
+        syncedFrames.clear()
     }
 
     companion object {

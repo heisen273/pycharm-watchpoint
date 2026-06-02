@@ -32,8 +32,23 @@ builtins._pycharm_watch_at       # name, file_hint, func_hint – locates the pa
 builtins._pycharm_unwatch
 builtins._pycharm_clear_watches
 builtins._pycharm_watchpoint_diag  # diagnostic about pydevd lookup
+builtins._pycharm_consume_last_hit # drain hits matching the IDE's pause location (§11)
+builtins._pycharm_locate_watches   # cross-frame: every live (name, id(frame)) pair – see below
 builtins._watchpoint_registry    # the singleton, for conftest cleanup
 ```
+
+`_pycharm_locate_watches()` powers the Variables-panel watch icon across the
+whole call stack. The IDE calls it on each pause AND right after arm/remove. It
+reports every `(name, id(frame))` where a watch is live RIGHT NOW, by identity –
+never by bare name – so the icon follows the watched object into caller/callee
+frames without ghost-decorating an unrelated same-named variable. Two sources:
+(1) every live `_local_watches` key (armed + propagated frames, auto-pruned on
+frame exit); (2) an identity scan of `sys._current_frames()` matching each
+`_AttributeWatch._obj_ref` object by `id()`, emitting `(local_name, id(frame))`
+per holding frame. Side-effect free (only reads `id()` + iterates `f_locals`).
+Returns base64 of UTF-8, records separated by U+0001, each `name`+U+0000+`frameid`;
+`""` = nothing watched (authoritative); `ERROR:`-prefixed = internal failure
+(the IDE then leaves its existing icons untouched rather than wiping them).
 
 `watch("name")` auto-picks a flavor:
 
