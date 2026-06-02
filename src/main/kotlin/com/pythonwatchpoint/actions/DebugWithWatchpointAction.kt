@@ -85,6 +85,9 @@ class DebugWithWatchpointAction : AnAction(), DumbAware {
             if (envs.remove("PYCHARM_WATCHPOINT_USER_ROOTS") != null) {
                 changed = true
             }
+            if (envs.remove("PYDEVD_USE_CYTHON") != null) {
+                changed = true
+            }
 
             val pythonPath = envs["PYTHONPATH"]
             if (pythonPath != null && pythonPath.contains("pycharm_watchpoint_")) {
@@ -122,11 +125,25 @@ class DebugWithWatchpointAction : AnAction(), DumbAware {
         }
     }
 
+    private fun loadBoostScript(): String? {
+        return try {
+            javaClass.getResourceAsStream("/python/pydevd_boost.py")
+                ?.bufferedReader()
+                ?.readText()
+        } catch (e: Exception) {
+            logger.warn("Failed to read pydevd_boost.py – boost disabled", e)
+            null
+        }
+    }
+
     /**
      * Writes a sitecustomize.py that decodes and execs watchpoint.py at interpreter
      * startup, then prepends its directory to PYTHONPATH and sets the activation env var.
      * Gated by PYCHARM_WATCHPOINT_ACTIVE so other interpreters that happen to inherit
      * the path don't accidentally boot watchpoint logic.
+     *
+     * Also forces PYDEVD_USE_CYTHON=NO and installs pydevd_boost patches for
+     * dramatically faster debug session startup (15-156x improvement on PEP 669 path).
      */
     private fun injectViaSiteCustomize(
         project: Project,
@@ -138,6 +155,14 @@ class DebugWithWatchpointAction : AnAction(), DumbAware {
             val siteCustomize = File(tempDir, "sitecustomize.py")
             val encodedCode = Base64.getEncoder().encodeToString(watchpointCode.toByteArray())
 
+            // Load and encode pydevd_boost.py for injection alongside watchpoint
+            val boostCode = loadBoostScript()
+            val encodedBoost = if (boostCode != null) {
+                Base64.getEncoder().encodeToString(boostCode.toByteArray())
+            } else {
+                ""
+            }
+
             siteCustomize.writeText("""
 import sys
 import os
@@ -145,6 +170,24 @@ import base64
 import types
 
 if os.environ.get('PYCHARM_WATCHPOINT_ACTIVE') == '1':
+    # Force pure-Python pydevd – we apply performance patches to it that make it
+    # faster than the (buggy) Cython version. Also prevents ImportError on Python
+    # versions where Cython .so files don't exist (3.13+).
+    os.environ['PYDEVD_USE_CYTHON'] = 'NO'
+
+    # Install pydevd boost patches (PEP 669 tracing optimizations)
+    _boost_code = '$encodedBoost'
+    if _boost_code and sys.version_info >= (3, 12):
+        try:
+            _boost_mod = types.ModuleType('_pycharm_watchpoint_boost')
+            sys.modules['_pycharm_watchpoint_boost'] = _boost_mod
+            exec(base64.b64decode(_boost_code).decode('utf-8'), _boost_mod.__dict__)
+            _boost_mod.install()
+        except Exception as e:
+            print(f"[WATCHPOINT-BOOST] Install failed (non-fatal): {e}", file=sys.stderr)
+    elif _boost_code:
+        print(f"[WATCHPOINT-BOOST] Skipped – Python {sys.version_info.major}.{sys.version_info.minor} < 3.12 (PEP 669 not available)", file=sys.stderr)
+
     try:
         # Bootstrap as a real module so WatchpointHit.__module__ == '_pycharm_watchpoint',
         # which is what the IDE-side exception breakpoint matches against.
@@ -157,6 +200,29 @@ if os.environ.get('PYCHARM_WATCHPOINT_ACTIVE') == '1':
         print(f"[WATCHPOINT] Loaded in process {os.getpid()}", file=sys.stderr)
     except Exception as e:
         print(f"[WATCHPOINT] Boot failed: {e}", file=sys.stderr)
+
+# Chain to the original sitecustomize (if any) that we're shadowing.
+# Our temp dir is prepended to PYTHONPATH, so without this, the system's
+# sitecustomize never runs – breaking path setup on some Python installs
+# (e.g. Homebrew, conda, pyenv).
+import importlib as _imp
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+_orig_path = [p for p in sys.path if os.path.abspath(p) != _this_dir]
+_saved_path = sys.path[:]
+try:
+    sys.path = _orig_path
+    # Remove ourselves from sys.modules so the real one can load
+    _us = sys.modules.pop('sitecustomize', None)
+    try:
+        _imp.import_module('sitecustomize')
+    except ImportError:
+        pass  # No system sitecustomize – that's fine
+    finally:
+        # Restore our module entry so Python doesn't try to re-import us
+        if _us is not None:
+            sys.modules['sitecustomize'] = _us
+finally:
+    sys.path = _saved_path
 """.trimIndent())
 
             val envs = config.envs.toMutableMap()
@@ -167,6 +233,7 @@ if os.environ.get('PYCHARM_WATCHPOINT_ACTIVE') == '1':
                 "${tempDir.absolutePath}${File.pathSeparator}$existingPath"
             }
             envs["PYCHARM_WATCHPOINT_ACTIVE"] = "1"
+            envs["PYDEVD_USE_CYTHON"] = "NO"
             project.basePath?.let { envs["PYCHARM_WATCHPOINT_USER_ROOTS"] = it }
 
 

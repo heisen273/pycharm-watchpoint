@@ -380,3 +380,13 @@ Everything Python: `src/main/resources/python/CLAUDE.md` or `CLAUDE_trimmed.md`.
 - "The pydevd pause – tread carefully" – the two rules; why CMD_STEP_OVER became a fallback.
 - "Anti-patterns" – things that look right but break in subtle ways (many backed by debugging sessions).
 
+## pydevd_boost – debugger performance patches
+
+Separate module (`src/main/resources/python/pydevd_boost.py`) that injects performance
+fixes into pydevd's PEP 669 tracing layer. Full docs: `src/main/resources/python/PYDEVD_BOOST.md`.
+
+Key constraints (hard-won lessons – do NOT retry):
+- **Cannot wrap monitoring callbacks** (`py_start_callback`, `py_raise_callback`) with Python functions – breaks `_getframe(1)` depth assumptions everywhere.
+- **Cannot call `sys.monitoring.register_callback()` after pydevd arms breakpoints** – invalidates local LINE events, breakpoints stop hitting.
+- **Must verify module is fully loaded** before patching – Python adds modules to `sys.modules` before executing their body.
+- Use `inspect.getsource()` + `exec()` for source-level injection (patch 5) – no extra frame, same depth contract.
