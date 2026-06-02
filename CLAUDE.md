@@ -115,7 +115,7 @@ Action groups:
    - **Clones** the currently-selected run config (does NOT mutate the user's saved config), renames to `"[WATCHPOINT] <original>"`.
    - `injectViaSiteCustomize(clonedConfig, pkg)`:
      - Writes each submodule to `<tempdir>/_pycharm_watchpoint/<name>.py` and a `sitecustomize.py` that does `import _pycharm_watchpoint` (the temp dir is on `PYTHONPATH`, so normal import + relative imports work; no base64/exec for the runtime – boost is still base64-exec'd).
-     - Sets `PYTHONPATH = <tempdir>:<existing>`, `PYCHARM_WATCHPOINT_ACTIVE=1`, `PYCHARM_WATCHPOINT_USER_ROOTS=<project.basePath>`.
+     - Sets `PYTHONPATH = <tempdir>:<existing>`, `PYCHARM_WATCHPOINT_ACTIVE=1`, `PYCHARM_WATCHPOINT_USER_ROOTS=<project.basePath>`. Boost is on by default; override with `PYCHARM_WATCHPOINT_BOOST=0`.
    - `ProgramRunnerUtil.executeConfiguration(...)`.
 
 2. `WatchpointDebugListener.processStarted`:
@@ -445,6 +445,14 @@ Everything Python: `src/main/resources/python/CLAUDE.md` or `CLAUDE_trimmed.md`.
 
 Separate module (`src/main/resources/python/pydevd_boost.py`) that injects performance
 fixes into pydevd's PEP 669 tracing layer. Full docs: `src/main/resources/python/PYDEVD_BOOST.md`.
+
+Enabled by default on Python 3.12+. Set `PYCHARM_WATCHPOINT_BOOST=0` in the run
+configuration environment to disable.
+
+Logging inside `pydevd_boost.py` is gated on `PYCHARM_WATCHPOINT_LOG=1` (same env var
+as the runtime). The "Applied N/M patches" summary and hook-installed lines are verbose-
+only; patch-skip warnings surface unconditionally since they indicate a compatibility
+problem. The sitecustomize "Disabled / Skipped" messages are also verbose-only.
 
 Key constraints (hard-won lessons – do NOT retry):
 - **Cannot wrap monitoring callbacks** (`py_start_callback`, `py_raise_callback`) with Python functions – breaks `_getframe(1)` depth assumptions everywhere.

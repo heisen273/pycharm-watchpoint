@@ -32,11 +32,13 @@ import inspect
 
 _LOG_PREFIX = "[WATCHPOINT-BOOST]"
 _applied = False
+_verbose = os.environ.get('PYCHARM_WATCHPOINT_LOG') == '1'
 
 
-def _log(msg):
-    """Log to stderr – visible in PyCharm's debug console."""
-    print(f"{_LOG_PREFIX} {msg}", file=sys.stderr)
+def _log(msg, *, always=False):
+    """Log to stderr. Gated on PYCHARM_WATCHPOINT_LOG=1 unless always=True."""
+    if always or _verbose:
+        print(f"{_LOG_PREFIX} {msg}", file=sys.stderr)
 
 
 def _validate_signature(fn, expected_params, fn_name):
@@ -104,7 +106,7 @@ def apply_patches(module):
         _log(f"  ACTIVE: {', '.join(applied)}")
     if skipped:
         for s in skipped:
-            _log(f"  SKIPPED: {s}")
+            _log(f"  SKIPPED: {s}", always=True)
 
 
 def _patch_should_enable_line_events(module):

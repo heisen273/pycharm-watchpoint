@@ -223,9 +223,10 @@ if os.environ.get('PYCHARM_WATCHPOINT_ACTIVE') == '1':
     # versions where Cython .so files don't exist (3.13+).
     os.environ['PYDEVD_USE_CYTHON'] = 'NO'
 
-    # Install pydevd boost patches (PEP 669 tracing optimizations)
+    # Install pydevd boost patches (PEP 669 tracing optimizations).
+    # Enabled by default; set PYCHARM_WATCHPOINT_BOOST=0 to disable.
     _boost_code = '$encodedBoost'
-    if _boost_code and sys.version_info >= (3, 12):
+    if _boost_code and sys.version_info >= (3, 12) and os.environ.get('PYCHARM_WATCHPOINT_BOOST', '1') != '0':
         try:
             _boost_mod = types.ModuleType('_pycharm_watchpoint_boost')
             sys.modules['_pycharm_watchpoint_boost'] = _boost_mod
@@ -233,8 +234,11 @@ if os.environ.get('PYCHARM_WATCHPOINT_ACTIVE') == '1':
             _boost_mod.install()
         except Exception as e:
             print(f"[WATCHPOINT-BOOST] Install failed (non-fatal): {e}", file=sys.stderr)
-    elif _boost_code:
-        print(f"[WATCHPOINT-BOOST] Skipped – Python {sys.version_info.major}.{sys.version_info.minor} < 3.12 (PEP 669 not available)", file=sys.stderr)
+    elif _boost_code and os.environ.get('PYCHARM_WATCHPOINT_LOG') == '1':
+        if os.environ.get('PYCHARM_WATCHPOINT_BOOST', '1') == '0':
+            print(f"[WATCHPOINT-BOOST] Disabled via PYCHARM_WATCHPOINT_BOOST=0", file=sys.stderr)
+        else:
+            print(f"[WATCHPOINT-BOOST] Skipped – Python {sys.version_info.major}.{sys.version_info.minor} < 3.12 (PEP 669 not available)", file=sys.stderr)
 
     try:
         # Import the runtime package written next to this sitecustomize. Our temp
