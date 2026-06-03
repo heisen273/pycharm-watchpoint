@@ -15,7 +15,7 @@ with the old and new values shown inline.
   - `Add Watchpoint` / `Remove Watchpoint` in the Variables panel context menu.
 - Highlights watchpoint hits in the editor and marks watched entries in the Variables tree.
 
-<img width="600" height="747" alt="ezgif-68c8ffb42ec7308f" src="https://github.com/user-attachments/assets/1de133e7-daae-4abf-882d-a49aa3861c1f" />
+<img width="500" alt="Python Watchpoint demo" src="https://raw.githubusercontent.com/heisen273/IntelliJ-Library-Stack-Frame-Hider/refs/heads/main/assets/preview_watchpoint_original.gif" />
 
 
 ## Current limitations
