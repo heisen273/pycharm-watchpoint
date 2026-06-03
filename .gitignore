@@ -54,3 +54,7 @@ bin/
 
 ### Mac OS ###
 .DS_Store
+
+### Stale local docs (kept on disk, not shipped) ###
+CLAUDE_long_not_up_to_date.md
+pydevd_boost_guide.md
