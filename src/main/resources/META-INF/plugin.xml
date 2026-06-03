@@ -1,11 +1,13 @@
 <idea-plugin>
     <id>com.pythonwatchpoint</id>
     <name>Python Watchpoint</name>
-    <vendor>YourName</vendor>
+    <vendor>heisen273</vendor>
     <description><![CDATA[
-        Adds true Python <b>watchpoint</b> support to PyCharm. When a watched local variable
-        or object attribute changes value, the debugger pauses at the mutation line and
-        highlights the exact location.
+        <b>Adds Python <b>Data breakpoints</b> (watchpoints) support to PyCharm. </b>
+        <p></p>
+        Python Watchpoint lets you break on <i>data</i> changes.
+        When a watched local variable or object attribute changes value, the debugger pauses at the mutation line and
+        highlights the exact location
 
         Main entry points:
         <ul>
@@ -16,9 +18,10 @@
 
         Highlights:
         <ul>
-          <li>Local-variable and object-attribute watchpoints.</li>
-          <li>Pause + inline visual feedback on hit.</li>
-          <li>Low overhead before first watch is armed (Python <code>sys.monitoring</code> based).</li>
+          <li>Watch local variables and object attributes for value changes.</li>
+          <li>On hit: pause at the mutation line, with the old → new value shown inline.</li>
+          <li>Watched values are marked in the Variables panel and tracked across stack frames.</li>
+          <li>Low overhead until the first watch is armed (built on Python <code>sys.monitoring</code>).</li>
         </ul>
 
         <b>Current limitations</b>
@@ -27,9 +30,13 @@
           <li>Works with PyCharm's <b>pydevd</b> debugger integration only.</li>
           <li><b>debugpy is not supported yet</b>.</li>
         </ul>
-
-        Demo GIFs and more examples are coming soon.
     ]]></description>
+
+    <change-notes><![CDATA[
+        <ul>
+          <li><b>Main release:</b> initial public release of Python Watchpoint for PyCharm.</li>
+        </ul>
+    ]]></change-notes>
 
     <!-- com.intellij.modules.pycharm gates installation to PyCharm only –
          IDEA + Python plugin has com.intellij.modules.python but NOT pycharm,
@@ -56,8 +63,16 @@
                 text="Debug with Watchpoint"
                 description="Start debugging with watchpoint support enabled"
                 icon="com.pythonwatchpoint.icons.WatchpointIcons.DebugWatch">
+            <!-- Debug session toolbar button (next to Step Over / Step Into) -->
+            <!-- New UI (2022.3+): the stepping buttons live in TopToolbar3 -->
+            <add-to-group group-id="XDebugger.ToolWindow.TopToolbar3" anchor="last"/>
+            <!-- Classic UI fallback: stepping buttons live in TopToolbar -->
             <add-to-group group-id="XDebugger.ToolWindow.TopToolbar" anchor="last"/>
+            <!-- Right top corner button -->
+            <!-- New UI (2022.3+) -->
             <add-to-group group-id="MainToolbarRight" anchor="first"/>
+<!--             Classic UI fallback -->
+            <add-to-group group-id="MainToolBar" anchor="first"/>
         </action>
 
         <action id="PythonWatchpoint.AddWatchpoint"

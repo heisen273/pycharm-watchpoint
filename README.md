@@ -1,6 +1,10 @@
 # Python Watchpoint
 
-PyCharm plugin that adds Python watchpoints: pause execution when a watched value changes.
+**Adds Python data breakpoints (watchpoints) support to PyCharm.**
+
+Python Watchpoint lets you break on _data_ changes. When a watched local variable or object
+attribute changes value, the debugger pauses at the mutation line and highlights the exact location
+with the old and new values shown inline.
 
 ## What it does
 
