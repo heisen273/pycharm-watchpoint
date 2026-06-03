@@ -7,9 +7,9 @@ import javax.swing.Icon
  * Plugin-owned icons. `IconLoader.getIcon` discovers the size and theme
  * variants placed next to the base path automatically:
  *  - `watchpoint.svg`                    – classic 16x16, light theme
- *  - `watchpoint_dark.svg`               – classic 16x16, dark theme
+ *  - `_unusedwatchpoint_dark.svg`        – classic 16x16, dark theme -- CURRENTLY UNUSED, as regular looks better
  *  - `watchpoint@20x20.svg`              – New UI 20x20, light theme
- *  - `watchpoint@20x20_dark.svg`         – New UI 20x20, dark theme
+ *  - `_unused_watchpoint@20x20_dark.svg`  – New UI 20x20, dark theme -- CURRENTLY UNUSED, as regular looks better
  *  - `debugwatchpoint.svg`               – classic 16x16, light theme
  *  - `debugwatchpoint_dark.svg`          – classic 16x16, dark theme
  *  - `debugwatchpoint@20x20.svg`         – New UI 20x20, light theme
