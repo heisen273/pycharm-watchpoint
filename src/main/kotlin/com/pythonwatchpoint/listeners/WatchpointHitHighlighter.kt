@@ -488,11 +488,27 @@ class WatchpointHitHighlighter(
         if (lineCount == 0) return
         val lineIndex = hit.line - 1
         if (lineIndex < 0 || lineIndex >= lineCount) return
+
+        // Skip scrolling if both the hit line and the secondary (caller) line are
+        // already visible – avoids jitter when everything is on screen already.
+        if (isLineVisible(editor, lineIndex)) {
+            val callerVisible = hit.callerLine <= 0 || hit.callerFile != hit.file ||
+                isLineVisible(editor, hit.callerLine - 1)
+            if (callerVisible) return
+        }
+
         val scrollOffset = editor.document.getLineStartOffset(lineIndex)
         editor.scrollingModel.scrollTo(
             editor.offsetToLogicalPosition(scrollOffset),
             ScrollType.CENTER,
         )
+    }
+
+    /** Returns true if the given 0-based [lineIndex] is within the editor's visible area. */
+    private fun isLineVisible(editor: Editor, lineIndex: Int): Boolean {
+        val visibleArea = editor.scrollingModel.visibleArea
+        val lineY = editor.logicalPositionToXY(com.intellij.openapi.editor.LogicalPosition(lineIndex, 0)).y
+        return lineY >= visibleArea.y && lineY < visibleArea.y + visibleArea.height
     }
 
     /**
