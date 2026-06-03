@@ -1,14 +1,21 @@
 package com.pythonwatchpoint.actions
 
+import com.intellij.execution.ExecutionManager
 import com.intellij.execution.ProgramRunnerUtil
 import com.intellij.execution.RunManager
 import com.intellij.execution.executors.DefaultDebugExecutor
+import com.intellij.execution.runners.ExecutionEnvironment
 import com.intellij.icons.AllIcons
+import com.intellij.ide.util.PropertiesComponent
 import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.DumbAware
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.ui.DoNotAskOption
+import com.intellij.openapi.ui.MessageDialogBuilder
+import com.intellij.openapi.ui.Messages
+import com.intellij.xdebugger.XDebugSession
 import com.intellij.xdebugger.XDebuggerManager
 import com.jetbrains.python.run.AbstractPythonRunConfiguration
 import com.pythonwatchpoint.icons.WatchpointIcons
@@ -32,6 +39,11 @@ class DebugWithWatchpointAction : AnAction(), DumbAware {
     override fun actionPerformed(e: AnActionEvent) {
         val project = e.project ?: return
 
+        // If our own debug session is already running, restart it in place. Without this
+        // every click clones a brand-new temporary config, so PyCharm's single-instance
+        // policy never applies and sessions pile up in parallel instead of restarting.
+        if (restartIfOurSessionRunning(project)) return
+
         // Defensive: scrub any leftover watchpoint environment from prior aborted runs.
         cleanAllConfigurations(project)
 
@@ -51,7 +63,7 @@ class DebugWithWatchpointAction : AnAction(), DumbAware {
 
         // Clone the original so we can mutate envs without contaminating the user's saved config.
         val clonedConfig = originalConfig.clone() as AbstractPythonRunConfiguration<*>
-        clonedConfig.name = "[WATCHPOINT] ${originalConfig.name}"
+        clonedConfig.name = "$CONFIG_PREFIX${originalConfig.name}"
 
         injectViaSiteCustomize(project, clonedConfig, watchpointPackage)
 
@@ -63,6 +75,76 @@ class DebugWithWatchpointAction : AnAction(), DumbAware {
         val executor = DefaultDebugExecutor.getDebugExecutorInstance()
         ProgramRunnerUtil.executeConfiguration(newSettings, executor)
     }
+
+    /**
+     * If the current debug session was launched by us (its run profile name carries the
+     * [CONFIG_PREFIX]), confirm with the user and restart it in place, returning true.
+     *
+     * Once we recognise the running session as ours we ALWAYS consume the click (return
+     * true), even on cancel or failure – otherwise actionPerformed would fall through and
+     * clone a brand-new config, which is exactly the "sessions pile up in parallel" bug.
+     *
+     * The restart itself is the platform's atomic stop-and-rerun of the already-injected
+     * clone (so the watchpoint runtime stays active). We gate it behind our own confirmation
+     * popup rather than relying on PyCharm's native prompt, because the cloned temporary
+     * config isn't reliably matched by the single-instance policy.
+     *
+     * The ExecutionEnvironment lives on XDebugSessionImpl (not the XDebugSession interface),
+     * so we read it reflectively to stay compatible across the supported PyCharm builds.
+     */
+    private fun restartIfOurSessionRunning(project: Project): Boolean {
+        val session = XDebuggerManager.getInstance(project).currentSession ?: return false
+        if (!isOurSession(session)) return false
+
+        val env = runCatching {
+            session.javaClass.getMethod("getExecutionEnvironment").invoke(session) as? ExecutionEnvironment
+        }.getOrNull()
+        if (env == null) {
+            logger.warn("Could not resolve ExecutionEnvironment for restart – ignoring click")
+            return true
+        }
+
+        if (confirmRestart(project)) {
+            // Re-queue the runtime package so the listener's evaluator fallback is armed for
+            // the fresh process (the sitecustomize path reuses the original temp dir anyway).
+            loadWatchpointPackage()?.let { WatchpointSessionManager.getInstance(project).startSession(it) }
+
+            ExecutionManager.getInstance(project).restartRunProfile(env)
+        }
+        return true
+    }
+
+    /**
+     * Asks the user to confirm stopping the running watchpoint session before restarting.
+     * Shows a Yes/No popup with a "Don't show this again" checkbox; once the user opts out,
+     * subsequent restarts proceed silently. Returns true if the restart should proceed.
+     */
+    private fun confirmRestart(project: Project): Boolean {
+        val props = PropertiesComponent.getInstance()
+        if (props.getBoolean(SKIP_RESTART_CONFIRM_KEY, false)) return true
+
+        return MessageDialogBuilder.yesNo(
+            "Restart with Watchpoint",
+            "A Watchpoint debug session is already running.\nStop it and start a new one?",
+        )
+            .yesText("Stop and Rerun")
+            .noText("Cancel")
+            .icon(Messages.getQuestionIcon())
+            .doNotAsk(object : DoNotAskOption.Adapter() {
+                override fun rememberChoice(isSelected: Boolean, exitCode: Int) {
+                    // Remember only when the box is ticked AND the user proceeds, so future
+                    // clicks restart without asking. Ticking + Cancel is not remembered.
+                    if (isSelected && exitCode == Messages.YES) {
+                        props.setValue(SKIP_RESTART_CONFIRM_KEY, true)
+                    }
+                }
+            })
+            .ask(project)
+    }
+
+    /** True if the session's run configuration is one this action launched. */
+    private fun isOurSession(session: XDebugSession): Boolean =
+        session.runProfile?.name?.startsWith(CONFIG_PREFIX) == true
 
     /**
      * Removes watchpoint markers (env var + PYTHONPATH temp dir) from every saved Python
@@ -304,7 +386,10 @@ finally:
         // any custom icon has to be re-applied here too – otherwise the very
         // first update() call after IDE start replaces the spectacles glyph
         // with whichever fallback is hard-coded below.
-        if (session != null) {
+        // Only show the restart affordance for a session WE launched ([WATCHPOINT] prefix);
+        // for a plain debug session the button stays "Debug with Watchpoint" and a click
+        // starts a fresh instrumented session rather than restarting an uninstrumented one.
+        if (session != null && isOurSession(session)) {
             e.presentation.text = "Restart with Watchpoint"
             e.presentation.icon = AllIcons.Actions.Restart
         } else {
@@ -314,6 +399,13 @@ finally:
     }
 
     companion object {
+        /** Prefix stamped onto the cloned run configuration so we can recognise our own sessions. */
+        private const val CONFIG_PREFIX = "[WATCHPOINT] "
+
+        /** PropertiesComponent flag: user ticked "Don't show this again" on the restart prompt. */
+        private const val SKIP_RESTART_CONFIRM_KEY = "pythonwatchpoint.restart.skipConfirm"
+
+
         /**
          * The submodules that make up the `_pycharm_watchpoint` runtime package,
          * under `src/main/resources/python/_pycharm_watchpoint/`. Single source of
