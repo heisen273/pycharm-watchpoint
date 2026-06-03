@@ -10,7 +10,7 @@ plugins {
     id("org.jetbrains.intellij.platform") version "2.16.0"   // was 2.2.1
 }
 group = "com.pythonwatchpoint"
-version = "1.0.0"
+version = "1.0.4"
 
 repositories {
     mavenCentral()
