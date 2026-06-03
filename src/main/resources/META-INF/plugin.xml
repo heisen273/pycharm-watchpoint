@@ -3,25 +3,32 @@
     <name>Python Watchpoint</name>
     <vendor>YourName</vendor>
     <description><![CDATA[
-        Adds <b>watchpoint</b> support to PyCharm for Python 3.12+: when a watched
-        local variable or object attribute changes value, the debugger pauses
-        automatically at the line that performed the change.
+        Adds true Python <b>watchpoint</b> support to PyCharm. When a watched local variable
+        or object attribute changes value, the debugger pauses at the mutation line and
+        highlights the exact location.
 
-        Two entry points:
+        Main entry points:
         <ul>
-          <li><b>Debug with Watchpoint</b> – debug toolbar action; injects watchpoint.py
-          into the new debug session so <code>watch("x")</code>, <code>watch("obj.attr")</code>
-          etc. are available from your code.</li>
-          <li><b>Add Watchpoint</b> – right-click any variable in the
-          debugger's Variables panel to arm a watchpoint on it from a paused session.
-          The same entry toggles to <b>Remove Watchpoint</b> when the selected variable
-          is already armed, and supports multi-select (mixed selections add to the
-          unwatched ones).</li>
+          <li><b>Debug with Watchpoint</b> – starts a debug session with the watchpoint runtime injected.</li>
+          <li><b>Add Watchpoint</b> – right-click any variable in the Variables panel while paused.
+          The same action toggles to <b>Remove Watchpoint</b> for already watched values.</li>
         </ul>
 
-        Implementation uses Python 3.12+ <code>sys.monitoring</code> with strict
-        per-code-object local events, so there is zero global overhead until you
-        watch something – even in very large codebases.
+        Highlights:
+        <ul>
+          <li>Local-variable and object-attribute watchpoints.</li>
+          <li>Pause + inline visual feedback on hit.</li>
+          <li>Low overhead before first watch is armed (Python <code>sys.monitoring</code> based).</li>
+        </ul>
+
+        <b>Current limitations</b>
+        <ul>
+          <li>Requires Python <b>3.12+</b>.</li>
+          <li>Works with PyCharm's <b>pydevd</b> debugger integration only.</li>
+          <li><b>debugpy is not supported yet</b>.</li>
+        </ul>
+
+        Demo GIFs and more examples are coming soon.
     ]]></description>
 
     <!-- com.intellij.modules.pycharm gates installation to PyCharm only –
