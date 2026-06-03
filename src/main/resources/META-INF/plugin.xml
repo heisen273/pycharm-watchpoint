@@ -9,7 +9,7 @@
         When a watched local variable or object attribute changes value, the debugger pauses at the mutation line and
         highlights the exact location
         <p></p>
-        <img src="https://raw.githubusercontent.com/heisen273/IntelliJ-Library-Stack-Frame-Hider/refs/heads/main/assets/preview_watchpointg.gif" alt="Python Watchpoint demo" width="600"/>
+        <img src="https://raw.githubusercontent.com/heisen273/IntelliJ-Library-Stack-Frame-Hider/refs/heads/main/assets/preview_watchpoint.gif" alt="Python Watchpoint demo" width="600"/>
         <p></p>
 
         Main entry points:
