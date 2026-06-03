@@ -17,6 +17,7 @@ with the old and new values shown inline.
 
 ## Current limitations
 
+- Requires **PyCharm 2023.3** or newer.
 - Python runtime support is **3.12+**.
 - Works with PyCharm's **pydevd** debugger flow.
 - **debugpy is not supported yet**.

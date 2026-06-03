@@ -23,7 +23,7 @@
 - Source / target: **Java 17** bytecode (`tasks.withType<KotlinCompile>` + `tasks.withType<JavaCompile>` with `options.release.set(17)`), Kotlin toolchain still JBR 21.
   - `jvmToolchain(21)` overrides the `kotlin { compilerOptions }` block and the `java { targetCompatibility }` extension in KGP 2.x – the only reliable override is configuring both compile tasks directly.
   - Java 17 class files (version 61.0) load in PyCharm 2023.x (JBR 17) through 2026.x (JBR 21). Do **not** raise to 21 – breaks older sandboxes.
-- `sinceBuild = "231"`, `untilBuild = "261.*"` – keep in sync with tested PyCharm version
+- `sinceBuild = "233"` (PyCharm 2023.3+), `untilBuild = "261.*"` – keep in sync with tested PyCharm version
 
 ## Long-running daemon trap
 

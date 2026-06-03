@@ -26,6 +26,7 @@
 
         <b>Current limitations</b>
         <ul>
+          <li>Requires <b>PyCharm 2023.3</b> or newer.</li>
           <li>Requires Python <b>3.12+</b>.</li>
           <li>Works with PyCharm's <b>pydevd</b> debugger integration only.</li>
           <li><b>debugpy is not supported yet</b>.</li>
