@@ -29,6 +29,10 @@
           <li>Requires Python <b>3.12+</b>.</li>
           <li>Works with PyCharm's <b>pydevd</b> debugger integration only.</li>
           <li><b>debugpy is not supported yet</b>.</li>
+          <li>In-place mutation of <b>C-extension objects</b> (NumPy, Pandas, etc.) is not
+          detected – e.g. <code>arr[0] = 99</code> changes the buffer in C without rebinding
+          the variable or triggering attribute assignment, so there is nothing to observe.
+          Reassigning the whole variable is still caught.</li>
         </ul>
     ]]></description>
 

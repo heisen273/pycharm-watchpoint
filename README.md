@@ -20,6 +20,10 @@ with the old and new values shown inline.
 - Python runtime support is **3.12+**.
 - Works with PyCharm's **pydevd** debugger flow.
 - **debugpy is not supported yet**.
+- **In-place mutation of C-extension objects (NumPy, Pandas, etc.) is not detected.**
+  Watchpoints hook Python-level name rebinding and attribute assignment; operations like
+  `arr[0] = 99` or `arr += 1` mutate the underlying buffer in C without either, so there
+  is nothing to observe. Reassigning the whole variable (`arr = np.zeros(3)`) is still caught.
 
 ## Quick start (development)
 
