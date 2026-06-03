@@ -1,4 +1,4 @@
-# Python Watchpoint  <img width="50" height="50" alt="watchpoint" src="https://github.com/user-attachments/assets/aa960e6e-dc14-409a-9f40-8be6a5cff3f7" />
+# Pycharm Watchpoint  <img width="50" height="50" alt="watchpoint" src="https://github.com/user-attachments/assets/aa960e6e-dc14-409a-9f40-8be6a5cff3f7" />
 
 **Adds Python data breakpoints (watchpoints) support to PyCharm.**
 
