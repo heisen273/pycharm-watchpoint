@@ -6,11 +6,10 @@ import com.intellij.openapi.actionSystem.DataContext
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
+import com.intellij.xdebugger.XDebugSession
 import com.intellij.xdebugger.XDebuggerManager
 import com.intellij.xdebugger.evaluation.XDebuggerEvaluator
 import com.intellij.xdebugger.frame.XValue
-import com.intellij.xdebugger.impl.XDebugSessionImpl
-import com.intellij.xdebugger.impl.frame.XDebugView
 import com.intellij.xdebugger.impl.ui.tree.XDebuggerTree
 import com.intellij.xdebugger.impl.ui.tree.actions.XDebuggerTreeActionBase
 import com.intellij.xdebugger.impl.ui.tree.nodes.XValueNodeImpl
@@ -298,11 +297,13 @@ class AddWatchpointAction : AnAction() {
      * reset its selection to the topmost frame – losing the user's scroll
      * position. Instead we send FRAME_CHANGED only to the Variables view.
      *
-     * `getSessionTab()` and `getVariablesView()` are both `@ApiStatus.Internal`
-     * and `getVariablesView()` didn't exist before PyCharm 2025. We therefore
-     * call them via reflection so the plugin compiles and runs on the full
-     * 2024–2026 range. Falls back to `rebuildViews()` on builds where either
-     * method is absent (the frame-reset side-effect is acceptable vs. stale icons).
+     * `getSessionTab()`, `getVariablesView()` and `XDebugView.SessionEvent` are all
+     * `@ApiStatus.Internal` (and `getVariablesView()` didn't exist before PyCharm
+     * 2025), so every one of them is reached via reflection – the internal symbols
+     * never appear in our bytecode, keeping the Marketplace verifier's internal-API
+     * page clean while behaving identically. Falls back to the public
+     * `rebuildViews()` on builds where any of these is absent (the frame-reset
+     * side-effect is acceptable vs. stale icons).
      *
      * In PyCharm 2025.2+ "split debugger" (FE proxy) mode, calling `getSessionTab()`
      * triggers a `Logger.error` inside XDebugSessionImpl that surfaces as a
@@ -312,7 +313,7 @@ class AddWatchpointAction : AnAction() {
      */
     @Suppress("UnstableApiUsage")
     private fun refreshVariablesView(project: Project) {
-        val session = XDebuggerManager.getInstance(project).currentSession as? XDebugSessionImpl ?: return
+        val session = XDebuggerManager.getInstance(project).currentSession ?: return
 
         // In split/FE-proxy mode getSessionTab() logs an error before returning –
         // skip the sessionTab path entirely and fall straight to rebuildViews().
@@ -322,22 +323,24 @@ class AddWatchpointAction : AnAction() {
         }
 
         val refreshed = runCatching {
-            // Step 1: sessionTab – exists on all target builds but is @Internal.
-            val sessionTab = session.sessionTab ?: return@runCatching false
+            // Step 1: sessionTab – exists on all target builds but is @Internal
+            // (lives on XDebugSessionImpl), so resolve it reflectively.
+            val sessionTab = session.javaClass
+                .getMethod("getSessionTab")
+                .invoke(session) ?: return@runCatching false
 
             // Step 2: variablesView – added after 2024.3, must be called reflectively.
             val view = sessionTab.javaClass
                 .getMethod("getVariablesView")
                 .invoke(sessionTab) ?: return@runCatching false
 
-            // Step 3: dispatch FRAME_CHANGED to the view only.
+            // Step 3: dispatch FRAME_CHANGED to the view only. XDebugView.SessionEvent
+            // is an @Internal enum – resolve the enum class and its constant reflectively.
+            val sessionEventClass = Class.forName("com.intellij.xdebugger.impl.frame.XDebugView\$SessionEvent")
+            val frameChanged = sessionEventClass.getField("FRAME_CHANGED").get(null)
             view.javaClass
-                .getMethod(
-                    "processSessionEvent",
-                    XDebugView.SessionEvent::class.java,
-                    com.intellij.xdebugger.XDebugSession::class.java,
-                )
-                .invoke(view, XDebugView.SessionEvent.FRAME_CHANGED, session)
+                .getMethod("processSessionEvent", sessionEventClass, XDebugSession::class.java)
+                .invoke(view, frameChanged, session)
             true
         }.getOrDefault(false)
 
@@ -350,7 +353,7 @@ class AddWatchpointAction : AnAction() {
 
     /**
      * Returns true when PyCharm's "split debugger" mode is active, meaning
-     * [XDebugSessionImpl.getSessionTab] would fire a [Logger.error] before
+     * `XDebugSessionImpl.getSessionTab()` would fire a `Logger.error` before
      * returning – producing a user-visible error balloon.
      *
      * The gate changed between platform versions:

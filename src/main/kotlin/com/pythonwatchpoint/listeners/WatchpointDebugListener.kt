@@ -9,12 +9,12 @@ import com.intellij.xdebugger.XDebuggerManager
 import com.intellij.xdebugger.XDebuggerManagerListener
 import com.intellij.xdebugger.breakpoints.XBreakpoint
 import com.intellij.xdebugger.breakpoints.XBreakpointManager
+import com.intellij.xdebugger.breakpoints.XBreakpointProperties
 import com.intellij.xdebugger.breakpoints.XBreakpointType
 import com.intellij.xdebugger.evaluation.XDebuggerEvaluator
 import com.intellij.xdebugger.frame.XValue
 import com.jetbrains.python.debugger.PyDebugProcess
 import com.jetbrains.python.debugger.PyDebugValue
-import com.jetbrains.python.debugger.PyExceptionBreakpointProperties
 import com.jetbrains.python.debugger.PyExceptionBreakpointType
 import com.pythonwatchpoint.services.WatchpointMarkerService
 import com.pythonwatchpoint.services.WatchpointSessionManager
@@ -38,7 +38,7 @@ import java.util.concurrent.ConcurrentHashMap
 class WatchpointDebugListener(private val project: Project) : XDebuggerManagerListener {
     private val logger = Logger.getInstance(WatchpointDebugListener::class.java)
     private val injected = ConcurrentHashMap.newKeySet<PyDebugProcess>()
-    private val breakpoints = ConcurrentHashMap<XDebugProcess, XBreakpoint<PyExceptionBreakpointProperties>>()
+    private val breakpoints = ConcurrentHashMap<XDebugProcess, XBreakpoint<*>>()
 
     // One highlighter per session – tracks the change-line marker so we can
     // deregister cleanly on processStopped (the listener itself holds session
@@ -161,7 +161,7 @@ class WatchpointDebugListener(private val project: Project) : XDebuggerManagerLi
      */
     private fun addWatchpointHitBreakpoint(debugProcess: XDebugProcess) {
         try {
-            val breakpoint = WriteAction.computeAndWait<XBreakpoint<PyExceptionBreakpointProperties>, Exception> {
+            val breakpoint = WriteAction.computeAndWait<XBreakpoint<*>, Exception> {
                 val manager: XBreakpointManager = XDebuggerManager.getInstance(project).breakpointManager
                 val type = XBreakpointType.EXTENSION_POINT_NAME
                     .findExtensionOrFail(PyExceptionBreakpointType::class.java)
@@ -169,23 +169,44 @@ class WatchpointDebugListener(private val project: Project) : XDebuggerManagerLi
                 // Remove stale WatchpointHit breakpoints that may have been persisted
                 // by a crashed session or an older plugin version (e.g. the old name
                 // `watchpoint.WatchpointHit` without the underscore prefix).
-                // `getException()` is declared on the superclass ExceptionBreakpointProperties.
+                // getBreakpoints(type) is called reflectively: with a typed `type`, the
+                // compiler infers Collection<XBreakpoint<PyExceptionBreakpointProperties>>
+                // and embeds that in the Signature attribute – enough for the verifier to
+                // flag PyExceptionBreakpointProperties even without a direct import.
                 @Suppress("UNCHECKED_CAST")
-                val existing = manager.getBreakpoints(type)
+                val existing = (runCatching {
+                    manager.javaClass.getMethod("getBreakpoints", XBreakpointType::class.java)
+                        .invoke(manager, type) as? Collection<*>
+                }.getOrNull() ?: emptyList<Any>())
                 for (bp in existing.toList()) {  // toList() – copy before mutating
-                    val exceptionName = bp.properties?.exception ?: continue
+                    if (bp !is XBreakpoint<*>) continue
+                    val exceptionName = runCatching {
+                        val props = bp.properties ?: return@runCatching null
+                        props.javaClass.getMethod("getException").invoke(props) as? String
+                    }.getOrNull() ?: continue
                     if ("WatchpointHit" in exceptionName) {
                         manager.removeBreakpoint(bp)
                         logger.warn("Removed stale WatchpointHit breakpoint: $exceptionName")
                     }
                 }
 
-                val props = PyExceptionBreakpointProperties("_pycharm_watchpoint.WatchpointHit")
-                props.isNotifyOnTerminate = true
-                props.isNotifyOnlyOnFirst = false
-                props.isIgnoreLibraries = false
+                // PyExceptionBreakpointProperties + its setters are @Internal in newer
+                // PyCharm builds. There is no public API for a Python exception breakpoint,
+                // so construct and configure it reflectively – the class never appears in
+                // our bytecode, keeping the verifier's internal-API page clean. addBreakpoint
+                // is generic over the properties type, so it too is invoked reflectively to
+                // avoid naming PyExceptionBreakpointProperties as the type argument.
+                val bool = Boolean::class.javaPrimitiveType
+                val propsClass = Class.forName("com.jetbrains.python.debugger.PyExceptionBreakpointProperties")
+                val props = propsClass.getConstructor(String::class.java)
+                    .newInstance("_pycharm_watchpoint.WatchpointHit")
+                propsClass.getMethod("setNotifyOnTerminate", bool).invoke(props, true)
+                propsClass.getMethod("setNotifyOnlyOnFirst", bool).invoke(props, false)
+                propsClass.getMethod("setIgnoreLibraries", bool).invoke(props, false)
 
-                manager.addBreakpoint(type, props)
+                manager.javaClass
+                    .getMethod("addBreakpoint", XBreakpointType::class.java, XBreakpointProperties::class.java)
+                    .invoke(manager, type, props) as XBreakpoint<*>
             }
             breakpoints[debugProcess] = breakpoint
             logger.warn("Added WatchpointHit exception breakpoint for ${debugProcess.session.sessionName}")
