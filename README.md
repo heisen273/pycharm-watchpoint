@@ -1,4 +1,4 @@
-# Python Watchpoint
+# Python Watchpoint  <img width="50" height="50" alt="watchpoint" src="https://github.com/user-attachments/assets/aa960e6e-dc14-409a-9f40-8be6a5cff3f7" />
 
 **Adds Python data breakpoints (watchpoints) support to PyCharm.**
 
@@ -15,6 +15,9 @@ with the old and new values shown inline.
   - `Add Watchpoint` / `Remove Watchpoint` in the Variables panel context menu.
 - Highlights watchpoint hits in the editor and marks watched entries in the Variables tree.
 
+<img width="600" height="747" alt="ezgif-68c8ffb42ec7308f" src="https://github.com/user-attachments/assets/1de133e7-daae-4abf-882d-a49aa3861c1f" />
+
+
 ## Current limitations
 
 - Requires **PyCharm 2023.3** or newer.
@@ -25,23 +28,6 @@ with the old and new values shown inline.
   Watchpoints hook Python-level name rebinding and attribute assignment; operations like
   `arr[0] = 99` or `arr += 1` mutate the underlying buffer in C without either, so there
   is nothing to observe. Reassigning the whole variable (`arr = np.zeros(3)`) is still caught.
-
-## Quick start (development)
-
-```bash
-./gradlew compileKotlin
-./gradlew runIde
-```
-
-## Packaging
-
-```bash
-./gradlew buildPlugin
-```
-
-Output zip:
-
-- `build/distributions/pythonwatchpoint-1.0.0.zip`
 
 ## Runtime docs
 
